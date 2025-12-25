@@ -5,7 +5,7 @@
 //!
 //! `App` owns:
 //! - the current selection (`current_index`)
-//! - render/prefetch requests and an LRU-like render cache
+//! - render requests and an LRU-like render cache
 //! - the worker thread (decode/resize/encode)
 //! - the terminal writer thread (the only stdout writer)
 //!
@@ -19,7 +19,7 @@ use ratatui_image::picker::Picker;
 
 use crate::fit::FitMode;
 use crate::kgp::KgpState;
-use crate::sender::{StatusIndicator, TerminalWriter, WriterRequest};
+use crate::sender::{StatusIndicator, TerminalWriter, WriterRequest, WriterResultKind};
 use crate::worker::{ImageRequest, ImageWorker};
 
 pub struct RenderedImage {
@@ -30,6 +30,7 @@ pub struct RenderedImage {
     pub encoded_chunks: Vec<Vec<u8>>,
     pub kgp_id: u32,
     pub transmitted: bool,
+    pub last_transmit_seq: u64,
 }
 
 fn render_cache_limit() -> usize {
@@ -53,12 +54,13 @@ pub struct App {
     worker: ImageWorker,
     writer: TerminalWriter,
     pending_request: Option<(PathBuf, (u32, u32), FitMode)>,
-    prefetch_request: Option<(PathBuf, (u32, u32), FitMode)>,
-    prefetch_flip: bool,
     render_cache: Vec<RenderedImage>,
     render_cache_limit: usize,
     next_kgp_id: u32,
     in_flight_transmit: Option<u32>,
+    pending_display: Option<(Rect, u32)>,
+    render_epoch: u64,
+    transmit_seq: u64,
 }
 
 pub fn is_tmux_env() -> bool {
@@ -70,7 +72,7 @@ fn ensure_tmux_allow_passthrough_on() {
 
     if is_tmux_env() {
         let _ = Command::new("tmux")
-            .args(["set-option", "-p", "allow-passthrough", "on"])
+            .args(["set-option", "-gq", "allow-passthrough", "on"])
             .output();
     }
 }
@@ -93,13 +95,37 @@ impl App {
             worker: ImageWorker::new(),
             writer: TerminalWriter::new(),
             pending_request: None,
-            prefetch_request: None,
-            prefetch_flip: false,
             render_cache: Vec::with_capacity(render_cache_limit),
             render_cache_limit,
             next_kgp_id: 1,
             in_flight_transmit: None,
+            pending_display: None,
+            render_epoch: 0,
+            transmit_seq: 0,
         })
+    }
+
+    fn alloc_kgp_id(&mut self) -> u32 {
+        // Kitty "unicode placeholders" encode the image id into the 24-bit RGB foreground color.
+        // Some terminals seem to lose exact RGB values when any component is 0 (e.g. treat 0 as
+        // "default"), which can make a transmitted image unplaceable even though we consider it
+        // "Ready". Very low values also appear prone to quantization, so spread ids across RGB.
+        //
+        // Generate a scrambled 24-bit id with each component kept away from 0.
+        const MIN_COMPONENT: u32 = 16;
+        const MUL: u32 = 0x9E3779;
+        loop {
+            let idx = self.next_kgp_id;
+            self.next_kgp_id = self.next_kgp_id.wrapping_add(1);
+
+            let id = idx.wrapping_mul(MUL) & 0x00FF_FFFF;
+            let r = (id >> 16) & 0xff;
+            let g = (id >> 8) & 0xff;
+            let b = id & 0xff;
+            if r >= MIN_COMPONENT && g >= MIN_COMPONENT && b >= MIN_COMPONENT {
+                return id;
+            }
+        }
     }
 
     pub fn move_by(&mut self, delta: i32) {
@@ -122,8 +148,6 @@ impl App {
         self.cancel_image_output();
         self.render_cache.clear();
         self.pending_request = None;
-        self.prefetch_request = None;
-        self.in_flight_transmit = None;
         self.kgp_state = KgpState::default();
     }
 
@@ -160,20 +184,32 @@ impl App {
 
     fn invalidate_render(&mut self) {
         self.pending_request = None;
-        self.prefetch_request = None;
-        self.in_flight_transmit = None;
+        // Note: Do NOT clear in_flight_transmit here.
+        // cancel_image_output() needs it to invalidate the correct cache entry.
     }
 
     fn current_path(&self) -> Option<&PathBuf> {
         self.images.get(self.current_index)
     }
 
+    fn should_retransmit(&self, rendered: &RenderedImage) -> bool {
+        self.should_retransmit_with_seq(rendered.transmitted, rendered.last_transmit_seq)
+    }
+
+    fn should_retransmit_with_seq(&self, transmitted: bool, last_transmit_seq: u64) -> bool {
+        if !transmitted {
+            return true;
+        }
+        let limit = self.render_cache_limit.max(1) as u64;
+        self.transmit_seq.saturating_sub(last_transmit_seq) >= limit
+    }
+
     pub fn poll_worker(&mut self) {
         while let Some(result) = self.worker.try_recv() {
-            if self.prefetch_request.as_ref()
-                == Some(&(result.path.clone(), result.target, result.fit_mode))
-            {
-                self.prefetch_request = None;
+            if self.pending_request.as_ref().is_some_and(|(p, t, f)| {
+                p == &result.path && *t == result.target && *f == result.fit_mode
+            }) {
+                self.pending_request = None;
             }
             // Add to cache (LRU: remove existing entry for same path+target, add to end)
             self.render_cache.retain(|r| {
@@ -192,21 +228,45 @@ impl App {
                 encoded_chunks: result.encoded_chunks,
                 kgp_id: result.kgp_id,
                 transmitted: false,
+                last_transmit_seq: 0,
             });
         }
     }
 
     pub fn poll_writer(&mut self) {
         while let Some(result) = self.writer.try_recv() {
-            // Mark as transmitted in cache
-            for rendered in &mut self.render_cache {
-                if rendered.kgp_id == result.kgp_id {
-                    rendered.transmitted = true;
-                    break;
+            if result.epoch != self.render_epoch {
+                continue;
+            }
+            let (kgp_id, transmitted) = match result.kind {
+                WriterResultKind::TransmitDone { kgp_id } => (kgp_id, true),
+                WriterResultKind::PlaceDone { kgp_id } => (kgp_id, false),
+            };
+
+            if transmitted {
+                self.transmit_seq = self.transmit_seq.saturating_add(1);
+                let seq = self.transmit_seq;
+                // Mark as transmitted in cache
+                for rendered in &mut self.render_cache {
+                    if rendered.kgp_id == kgp_id {
+                        rendered.transmitted = true;
+                        rendered.last_transmit_seq = seq;
+                        break;
+                    }
                 }
             }
-            if self.in_flight_transmit == Some(result.kgp_id) {
+
+            if self.in_flight_transmit == Some(kgp_id) && transmitted {
                 self.in_flight_transmit = None;
+            }
+
+            if self
+                .pending_display
+                .as_ref()
+                .is_some_and(|(_, pending_id)| *pending_id == kgp_id)
+                && let Some((area, id)) = self.pending_display.take()
+            {
+                self.kgp_state.set_last(area, id);
             }
         }
     }
@@ -218,6 +278,9 @@ impl App {
         allow_transmission: bool,
     ) -> StatusIndicator {
         if !allow_transmission {
+            return StatusIndicator::Busy;
+        }
+        if self.pending_display.is_some() {
             return StatusIndicator::Busy;
         }
         if self.in_flight_transmit.is_some() {
@@ -249,11 +312,27 @@ impl App {
             return StatusIndicator::Busy;
         };
 
-        if !rendered.transmitted {
+        if self.should_retransmit(rendered) {
             return StatusIndicator::Busy;
         }
 
-        if self.kgp_state.last_kgp_id() != Some(rendered.kgp_id) {
+        // Compute expected placement area and require it to match last successful display.
+        let cells_w = rendered.actual_size.0.div_ceil(u32::from(cell_w));
+        let cells_h = rendered.actual_size.1.div_ceil(u32::from(cell_h));
+        let cells_w = cells_w.min(u32::from(image_area.width)) as u16;
+        let cells_h = cells_h.min(u32::from(image_area.height)) as u16;
+        let offset_x = (image_area.width.saturating_sub(cells_w)) / 2;
+        let offset_y = (image_area.height.saturating_sub(cells_h)) / 2;
+        let area = Rect::new(
+            image_area.x + offset_x,
+            image_area.y + offset_y,
+            cells_w,
+            cells_h,
+        );
+
+        if self.kgp_state.last_area() != Some(area)
+            || self.kgp_state.last_kgp_id() != Some(rendered.kgp_id)
+        {
             return StatusIndicator::Busy;
         }
 
@@ -269,102 +348,34 @@ impl App {
         });
     }
 
-    /// Best-effort prefetch for nearby images (currently ±2).
-    ///
-    /// Prefetch is intentionally conservative: it only runs once the current image is displayed.
-    pub fn maybe_prefetch(&mut self, terminal_size: Rect) {
-        if self.images.len() <= 1 {
-            return;
-        }
-        if self.in_flight_transmit.is_some() {
-            return;
-        }
-
-        let Some(current_path) = self.current_path() else {
-            return;
-        };
-
-        let full = Rect::new(0, 0, terminal_size.width, terminal_size.height);
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(full);
-        let image_area = chunks[0];
-
-        let (cell_w, cell_h) = self.picker.font_size();
-        if cell_w == 0 || cell_h == 0 || image_area.width == 0 || image_area.height == 0 {
-            return;
-        }
-
-        let max_w_px = u32::from(image_area.width) * u32::from(cell_w);
-        let max_h_px = u32::from(image_area.height) * u32::from(cell_h);
-        let target = (max_w_px, max_h_px);
-
-        // Only prefetch when the current image is fully ready/displayed.
-        let Some(current_cached) = self
-            .render_cache
-            .iter()
-            .find(|r| &r.path == current_path && r.target == target && r.fit_mode == self.fit_mode)
-        else {
-            return;
-        };
-        if !current_cached.transmitted
-            || self.kgp_state.last_kgp_id() != Some(current_cached.kgp_id)
-        {
-            return;
-        }
-
-        let len = self.images.len();
-        let next1 = (self.current_index + 1) % len;
-        let prev1 = (self.current_index + len - 1) % len;
-        let next2 = (self.current_index + 2) % len;
-        let prev2 = (self.current_index + len - 2) % len;
-
-        let candidates = if self.prefetch_flip {
-            [prev1, next1, prev2, next2]
-        } else {
-            [next1, prev1, next2, prev2]
-        };
-
-        for idx in candidates {
-            let Some(path) = self.images.get(idx).cloned() else {
-                continue;
-            };
-            if path == *current_path {
-                continue;
-            }
-            if self
-                .render_cache
-                .iter()
-                .any(|r| r.path == path && r.target == target && r.fit_mode == self.fit_mode)
-            {
-                continue;
-            }
-            if self.prefetch_request.as_ref() == Some(&(path.clone(), target, self.fit_mode)) {
-                continue;
-            }
-
-            let kgp_id = self.next_kgp_id;
-            self.next_kgp_id = self.next_kgp_id.wrapping_add(1).max(1);
-            self.worker.request(ImageRequest {
-                path: path.clone(),
-                target,
-                fit_mode: self.fit_mode,
-                kgp_id,
-                is_tmux: is_tmux_env(),
-                is_prefetch: true,
-            });
-            self.prefetch_request = Some((path, target, self.fit_mode));
-            self.prefetch_flip = !self.prefetch_flip;
-            return;
-        }
-    }
-
     /// Cancel any in-flight image output (best-effort).
     pub fn cancel_image_output(&mut self) {
-        let kgp_id = self.in_flight_transmit;
+        self.render_epoch = self.render_epoch.saturating_add(1);
+        // Get area before clearing pending_display.
+        // This area might have partial placement data that needs to be erased.
+        let cancel_area = self.pending_display.map(|(area, _)| area);
+
         self.writer.send(WriterRequest::CancelImage {
-            kgp_id,
+            kgp_id: self.in_flight_transmit,
             is_tmux: is_tmux_env(),
+            area: cancel_area,
+            epoch: self.render_epoch,
         });
-        self.in_flight_transmit = None;
+
+        // Only invalidate the in-flight entry (not yet fully transmitted).
+        // Entries with transmitted=true have already been sent to terminal
+        // and can be safely re-placed without re-transmission.
+        if let Some(flight_id) = self.in_flight_transmit.take() {
+            for rendered in &mut self.render_cache {
+                if rendered.kgp_id == flight_id {
+                    rendered.transmitted = false;
+                    break;
+                }
+            }
+        }
+
+        self.pending_display = None;
+        self.kgp_state.invalidate();
     }
 
     /// Request rendering / placement for the current image.
@@ -403,9 +414,17 @@ impl App {
             .iter()
             .position(|r| r.path == path && r.target == target && r.fit_mode == self.fit_mode);
         if let Some(idx) = cached_idx {
-            let rendered = &self.render_cache[idx];
-            let kgp_id = rendered.kgp_id;
-            let actual_size = rendered.actual_size;
+            let (kgp_id, actual_size, encoded_chunks, transmitted, last_transmit_seq) = {
+                let rendered = &self.render_cache[idx];
+                (
+                    rendered.kgp_id,
+                    rendered.actual_size,
+                    rendered.encoded_chunks.clone(),
+                    rendered.transmitted,
+                    rendered.last_transmit_seq,
+                )
+            };
+            let retransmit = self.should_retransmit_with_seq(transmitted, last_transmit_seq);
 
             // Calculate area for placement based on actual image size
             let cells_w = actual_size.0.div_ceil(u32::from(cell_w));
@@ -422,7 +441,7 @@ impl App {
             );
 
             // Check if already transmitted (no need to re-send data, just place)
-            if rendered.transmitted {
+            if transmitted && !retransmit {
                 // Navigation/scrolling: do not touch stdout at all (keep status bar snappy).
                 if !allow_transmission {
                     return;
@@ -434,13 +453,18 @@ impl App {
                 {
                     return;
                 }
+                if self.pending_display == Some((area, kgp_id)) {
+                    return;
+                }
 
                 self.writer.send(WriterRequest::ImagePlace {
                     area,
                     kgp_id,
                     old_area,
+                    epoch: self.render_epoch,
                 });
-                self.kgp_state.set_last(area, kgp_id);
+                self.pending_display = Some((area, kgp_id));
+                self.kgp_state.set_last_area(area);
                 return;
             }
 
@@ -456,28 +480,27 @@ impl App {
             }
             self.in_flight_transmit = Some(kgp_id);
 
-            let encoded_chunks = rendered.encoded_chunks.clone();
             self.writer.send(WriterRequest::ImageTransmit {
                 encoded_chunks,
                 area,
                 kgp_id,
                 old_area,
+                epoch: self.render_epoch,
             });
-            self.kgp_state.set_last(area, kgp_id);
+            self.pending_display = Some((area, kgp_id));
+            self.kgp_state.set_last_area(area);
             return;
         }
 
         // Request from worker if not already pending
         if self.pending_request.as_ref() != Some(&(path.clone(), target, self.fit_mode)) {
-            let kgp_id = self.next_kgp_id;
-            self.next_kgp_id = self.next_kgp_id.wrapping_add(1).max(1);
+            let kgp_id = self.alloc_kgp_id();
             self.worker.request(ImageRequest {
                 path: path.clone(),
                 target,
                 fit_mode: self.fit_mode,
                 kgp_id,
                 is_tmux,
-                is_prefetch: false,
             });
             self.pending_request = Some((path, target, self.fit_mode));
         }
@@ -549,12 +572,13 @@ mod tests {
             worker: ImageWorker::new(),
             writer: TerminalWriter::new(),
             pending_request: None,
-            prefetch_request: None,
-            prefetch_flip: false,
             render_cache: Vec::new(),
             render_cache_limit: 5,
             next_kgp_id: 1,
             in_flight_transmit: None,
+            pending_display: None,
+            render_epoch: 0,
+            transmit_seq: 0,
         }
     }
 
@@ -636,14 +660,13 @@ mod tests {
             encoded_chunks: vec![b"x".to_vec()],
             kgp_id: 1,
             transmitted: true,
+            last_transmit_seq: 1,
         });
-        app.prefetch_request = Some((PathBuf::from("y.png"), (1, 1), FitMode::Normal));
         app.pending_request = Some((PathBuf::from("y.png"), (1, 1), FitMode::Normal));
         app.in_flight_transmit = Some(1);
 
         app.reload();
         assert!(app.render_cache.is_empty());
-        assert!(app.prefetch_request.is_none());
         assert!(app.pending_request.is_none());
         assert!(app.in_flight_transmit.is_none());
     }

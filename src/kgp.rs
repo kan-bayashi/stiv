@@ -27,34 +27,35 @@ pub fn delete_all(is_tmux: bool) -> Vec<u8> {
     buf
 }
 
-pub fn delete_id(is_tmux: bool, id: u32) -> Vec<u8> {
-    let (start, escape, close) = if is_tmux {
-        (TMUX_START, TMUX_ESCAPE, TMUX_CLOSE)
-    } else {
-        ("\x1b", "\x1b", "")
-    };
-
-    let mut buf = Vec::with_capacity(64);
-    _ = write!(buf, "{start}_Gq=2,a=d,d=i,i={id}{escape}\\{close}");
-    buf
-}
-
 #[derive(Default)]
 pub struct KgpState {
-    last: Option<(Rect, u32)>,
+    last_area: Option<Rect>,
+    last_kgp_id: Option<u32>,
 }
 
 impl KgpState {
     pub fn last_area(&self) -> Option<Rect> {
-        self.last.map(|(area, _)| area)
+        self.last_area
     }
 
     pub fn last_kgp_id(&self) -> Option<u32> {
-        self.last.map(|(_, kgp_id)| kgp_id)
+        self.last_kgp_id
     }
 
     pub fn set_last(&mut self, area: Rect, kgp_id: u32) {
-        self.last = Some((area, kgp_id));
+        self.last_area = Some(area);
+        self.last_kgp_id = Some(kgp_id);
+    }
+
+    /// Invalidate kgp_id while preserving area (for erase_rows on next display).
+    pub fn invalidate(&mut self) {
+        self.last_kgp_id = None;
+    }
+
+    /// Update last_area without changing last_kgp_id.
+    /// Called when sending ImagePlace/ImageTransmit to track what area is being placed.
+    pub fn set_last_area(&mut self, area: Rect) {
+        self.last_area = Some(area);
     }
 }
 
@@ -148,10 +149,6 @@ pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>>
         buf.extend_from_slice(chunk);
         _ = write!(&mut buf, "{escape}\\{close}");
         chunks.push(buf);
-    }
-
-    if !close.is_empty() {
-        chunks.push(close.as_bytes().to_vec());
     }
 
     chunks

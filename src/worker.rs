@@ -8,7 +8,7 @@
 //! - resize based on terminal size and `FitMode`
 //! - encode to Kitty Graphics Protocol chunks for transmission
 //!
-//! Requests may be marked as prefetch; prefetch is best-effort and can be preempted.
+//! Requests are best-effort; newer requests may preempt older ones.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -25,7 +25,6 @@ pub struct ImageRequest {
     pub fit_mode: FitMode,
     pub kgp_id: u32,
     pub is_tmux: bool,
-    pub is_prefetch: bool,
 }
 
 pub struct ImageResult {
@@ -59,12 +58,14 @@ impl ImageWorker {
         }
     }
 
-    fn drain_to_latest(request_rx: &Receiver<ImageRequest>, current: ImageRequest) -> ImageRequest {
-        let mut latest = current;
+    fn drain_to_latest(
+        request_rx: &Receiver<ImageRequest>,
+        mut current: ImageRequest,
+    ) -> ImageRequest {
         while let Ok(newer) = request_rx.try_recv() {
-            latest = newer;
+            current = newer;
         }
-        latest
+        current
     }
 
     fn worker_loop(request_rx: Receiver<ImageRequest>, result_tx: Sender<ImageResult>) {
@@ -152,22 +153,6 @@ impl ImageWorker {
                 continue;
             }
 
-            // Prefetch is best-effort. Give foreground requests a chance to preempt before encode.
-            if req.is_prefetch {
-                let mut preempted = false;
-                for _ in 0..8 {
-                    if let Ok(newer) = request_rx.try_recv() {
-                        pending = Some(Self::drain_to_latest(&request_rx, newer));
-                        preempted = true;
-                        break;
-                    }
-                    thread::yield_now();
-                }
-                if preempted {
-                    continue;
-                }
-            }
-
             // Encode
             let encode_start = std::time::Instant::now();
             let encoded_chunks = encode_chunks(&resized, req.kgp_id, req.is_tmux);
@@ -182,9 +167,8 @@ impl ImageWorker {
                 {
                     let _ = writeln!(
                         f,
-                        "kgp_id={} prefetch={} path={:?} decode={:?} resize={:?} encode={:?} orig=({},{}) target=({},{}) actual=({},{})",
+                        "kgp_id={} path={:?} decode={:?} resize={:?} encode={:?} orig=({},{}) target=({},{}) actual=({},{})",
                         req.kgp_id,
-                        req.is_prefetch,
                         req.path,
                         decode_elapsed,
                         resize_elapsed,

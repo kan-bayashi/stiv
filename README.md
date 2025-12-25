@@ -8,7 +8,7 @@ A terminal-based image viewer with sxiv-like keybindings. Works over SSH.
 
 - Kitty Graphics Protocol (KGP) image rendering
 - sxiv/vim-like keyboard navigation (counts supported)
-- Prefetch + small render cache for snappy navigation
+- Render cache for snappy navigation
 - `Fit` toggle (upscale to viewport) + `Normal` (shrink-only)
 
 ## Requirements

@@ -10,7 +10,7 @@ There are three concurrent “lanes”:
 1. **Main thread** (`src/main.rs`)
    - Reads key events.
    - Updates application state.
-   - Decides when to request rendering and when to prefetch.
+   - Decides when to request rendering.
    - Sends status updates.
 
 2. **Worker thread** (`src/worker.rs`)
@@ -50,13 +50,6 @@ This allows the writer to:
 When the user navigates while an image transmission is in-flight:
 
 - the main thread sends `CancelImage` to the writer
-- the writer drops the current image task and (best-effort) sends `delete_id` for the in-flight KGP id
+- the writer drops the current image task
 
 This avoids the “wait for large image I/O” feeling during rapid navigation.
-
-## Prefetch
-
-Prefetch is best-effort and runs only when the current image is fully displayed (`Ready` indicator).
-The worker gives foreground requests a chance to preempt a prefetch right before encoding.
-
-See also: `CONTRIBUTING.md`.

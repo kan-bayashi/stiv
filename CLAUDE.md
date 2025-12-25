@@ -22,7 +22,7 @@ sivit/
 │   └── development.md
 ├── src/
 │   ├── main.rs    # Entry point, CLI parsing, event loop
-│   ├── app.rs     # App state, navigation, cache/prefetch orchestration
+│   ├── app.rs     # App state, navigation, cache orchestration
 │   ├── fit.rs     # Fit mode (Normal/Fit)
 │   ├── kgp.rs     # Kitty Graphics Protocol helpers (encode/place/erase)
 │   ├── sender.rs  # TerminalWriter (single stdout writer, status priority, cancel)

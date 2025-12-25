@@ -18,7 +18,7 @@ use std::thread::{self, JoinHandle};
 
 use ratatui::layout::Rect;
 
-use crate::kgp::{delete_all, delete_id, erase_rows, place_rows};
+use crate::kgp::{delete_all, erase_rows, place_rows};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusIndicator {
@@ -39,12 +39,14 @@ pub enum WriterRequest {
         area: Rect,
         kgp_id: u32,
         old_area: Option<Rect>,
+        epoch: u64,
     },
     /// Place a previously transmitted image in the terminal area.
     ImagePlace {
         area: Rect,
         kgp_id: u32,
         old_area: Option<Rect>,
+        epoch: u64,
     },
     /// Clear any KGP overlays (used on shutdown).
     ClearAll {
@@ -55,17 +57,27 @@ pub enum WriterRequest {
     CancelImage {
         kgp_id: Option<u32>,
         is_tmux: bool,
+        area: Option<Rect>,
+        epoch: u64,
     },
     Shutdown,
 }
 
 pub struct WriterResult {
-    pub kgp_id: u32,
+    pub kind: WriterResultKind,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterResultKind {
+    TransmitDone { kgp_id: u32 },
+    PlaceDone { kgp_id: u32 },
 }
 
 struct Task {
     chunks: VecDeque<Vec<u8>>,
-    complete_kgp_id: Option<u32>,
+    complete: Option<WriterResultKind>,
+    epoch: u64,
 }
 
 pub struct TerminalWriter {
@@ -108,6 +120,7 @@ impl TerminalWriter {
         let mut last_status: Option<(String, (u16, u16), StatusIndicator)> = None;
         let mut status_dirty = false;
         let mut current_task: Option<Task> = None;
+        let mut current_epoch: u64 = 0;
         let mut should_quit = false;
         let mut bytes_since_flush: usize = 0;
         const FLUSH_THRESHOLD: usize = 64 * 1024;
@@ -127,6 +140,7 @@ impl TerminalWriter {
                         &mut current_task,
                         is_tty,
                         &mut out,
+                        &mut current_epoch,
                     ),
                     Err(_) => break,
                 }
@@ -141,6 +155,7 @@ impl TerminalWriter {
                     &mut current_task,
                     is_tty,
                     &mut out,
+                    &mut current_epoch,
                 );
                 if should_quit {
                     break;
@@ -159,9 +174,16 @@ impl TerminalWriter {
             }
 
             if let Some(task) = &mut current_task {
+                if task.epoch != current_epoch {
+                    current_task = None;
+                    continue;
+                }
                 if !is_tty {
-                    if let Some(kgp_id) = task.complete_kgp_id {
-                        let _ = result_tx.send(WriterResult { kgp_id });
+                    if let Some(kind) = task.complete {
+                        let _ = result_tx.send(WriterResult {
+                            kind,
+                            epoch: task.epoch,
+                        });
                     }
                     current_task = None;
                     continue;
@@ -178,8 +200,11 @@ impl TerminalWriter {
                 } else {
                     let _ = out.flush();
                     bytes_since_flush = 0;
-                    if let Some(kgp_id) = task.complete_kgp_id {
-                        let _ = result_tx.send(WriterResult { kgp_id });
+                    if let Some(kind) = task.complete {
+                        let _ = result_tx.send(WriterResult {
+                            kind,
+                            epoch: task.epoch,
+                        });
                     }
                     current_task = None;
                 }
@@ -195,6 +220,7 @@ impl TerminalWriter {
         current_task: &mut Option<Task>,
         is_tty: bool,
         out: &mut impl Write,
+        current_epoch: &mut u64,
     ) {
         match msg {
             WriterRequest::Shutdown => {
@@ -216,15 +242,30 @@ impl TerminalWriter {
                     let _ = out.flush();
                 }
             }
-            WriterRequest::CancelImage { kgp_id, is_tmux } => {
-                *current_task = None;
+            WriterRequest::CancelImage {
+                kgp_id,
+                is_tmux,
+                area,
+                epoch,
+            } => {
+                if epoch >= *current_epoch {
+                    *current_epoch = epoch;
+                    *current_task = None;
+                }
                 if is_tty {
-                    if let Some(id) = kgp_id {
-                        let _ = out.write_all(&delete_id(is_tmux, id));
-                        let _ = out.write_all(b"\x1b[0m");
-                    } else {
-                        let _ = out.write_all(b"\x1b[0m");
-                    }
+                    // Do not delete ids here: it's racy (the transmit may already have completed)
+                    // and can lead to "Ready but not displayed" until a resize forces a re-send.
+                    //
+                    // Cancellation is best-effort: stop writing further chunks so status updates
+                    // remain responsive.
+                    //
+                    // Note: We do NOT erase here. Erasing on cancel causes blank screen when
+                    // navigation resumes before a new ImagePlace is sent (navigation latch).
+                    // Instead, task_place/task_transmit always erase old_area to clean up.
+                    let _ = kgp_id;
+                    let _ = is_tmux;
+                    let _ = area;
+                    let _ = out.write_all(b"\x1b[0m");
                     let _ = out.flush();
                 }
             }
@@ -233,25 +274,36 @@ impl TerminalWriter {
                 area,
                 kgp_id,
                 old_area,
+                epoch,
             } => {
-                *current_task = Some(Self::task_transmit(encoded_chunks, area, kgp_id, old_area));
+                if epoch < *current_epoch {
+                    return;
+                }
+                *current_epoch = epoch;
+                *current_task =
+                    Some(Self::task_transmit(encoded_chunks, area, kgp_id, old_area, epoch));
             }
             WriterRequest::ImagePlace {
                 area,
                 kgp_id,
                 old_area,
+                epoch,
             } => {
-                *current_task = Some(Self::task_place(area, kgp_id, old_area));
+                if epoch < *current_epoch {
+                    return;
+                }
+                *current_epoch = epoch;
+                *current_task = Some(Self::task_place(area, kgp_id, old_area, epoch));
             }
         }
     }
 
-    fn task_place(area: Rect, kgp_id: u32, old_area: Option<Rect>) -> Task {
+    fn task_place(area: Rect, kgp_id: u32, old_area: Option<Rect>, epoch: u64) -> Task {
         let mut chunks = VecDeque::new();
 
-        if let Some(old) = old_area
-            && old != area
-        {
+        // Always erase old_area if provided (even if old == new).
+        // This ensures partial placement data from cancelled tasks is cleaned up.
+        if let Some(old) = old_area {
             for row in erase_rows(old) {
                 chunks.push_back(row);
             }
@@ -263,7 +315,8 @@ impl TerminalWriter {
 
         Task {
             chunks,
-            complete_kgp_id: None,
+            complete: Some(WriterResultKind::PlaceDone { kgp_id }),
+            epoch,
         }
     }
 
@@ -272,12 +325,13 @@ impl TerminalWriter {
         area: Rect,
         kgp_id: u32,
         old_area: Option<Rect>,
+        epoch: u64,
     ) -> Task {
         let mut chunks = VecDeque::new();
 
-        if let Some(old) = old_area
-            && old != area
-        {
+        // Always erase old_area if provided (even if old == new).
+        // This ensures partial placement data from cancelled tasks is cleaned up.
+        if let Some(old) = old_area {
             for row in erase_rows(old) {
                 chunks.push_back(row);
             }
@@ -293,7 +347,8 @@ impl TerminalWriter {
 
         Task {
             chunks,
-            complete_kgp_id: Some(kgp_id),
+            complete: Some(WriterResultKind::TransmitDone { kgp_id }),
+            epoch,
         }
     }
 

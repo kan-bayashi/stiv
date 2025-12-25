@@ -13,7 +13,7 @@ cargo clippy --all-targets --all-features
 ## Project layout
 
 - `src/main.rs`: CLI + event loop
-- `src/app.rs`: app state, cache/prefetch orchestration
+- `src/app.rs`: app state, cache orchestration
 - `src/worker.rs`: image decode/resize/encode (thread)
 - `src/sender.rs`: `TerminalWriter` (single stdout writer, status priority, cancel)
 - `src/kgp.rs`: Kitty Graphics Protocol helpers

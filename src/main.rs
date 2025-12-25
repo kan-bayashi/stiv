@@ -6,7 +6,7 @@
 //! This module:
 //! - parses CLI args (multiple file/dir paths)
 //! - runs the main input loop (vim-like navigation + counts)
-//! - decides when to request renders/prefetches
+//! - decides when to request renders
 //! - sends status updates to `TerminalWriter`
 //!
 //! Terminal output is centralized in `TerminalWriter` (see `src/sender.rs`).
@@ -246,9 +246,6 @@ fn run(images: Vec<PathBuf>) -> Result<()> {
         // - Cached images (transmitted=true): always display instantly (fast, just placement)
         // - New images (transmitted=false): only transmit after user stops navigating (debounce)
         app.prepare_render_request(terminal_rect, allow_transmission);
-        if allow_transmission {
-            app.maybe_prefetch(terminal_rect);
-        }
 
         // Wait for next event or worker result.
         // While navigating, keep the loop tighter so the status bar feels immediate.
