@@ -10,7 +10,7 @@ There are three concurrent “lanes”:
 1. **Main thread** (`src/main.rs`)
    - Reads key events.
    - Updates application state.
-   - Decides when to request rendering and when to prefetch.
+   - Decides when to request rendering.
    - Sends status updates.
 
 2. **Worker thread** (`src/worker.rs`)
@@ -49,14 +49,36 @@ This allows the writer to:
 
 When the user navigates while an image transmission is in-flight:
 
-- the main thread sends `CancelImage` to the writer
-- the writer drops the current image task and (best-effort) sends `delete_id` for the in-flight KGP id
+- **If not transmitting**: the main thread sends `CancelImage` to the writer, dropping the current task.
+- **If transmitting**: cancellation is skipped to ensure the terminal receives complete image data.
 
-This avoids the “wait for large image I/O” feeling during rapid navigation.
+This design prevents "blank screen" issues that occur when image data is partially transmitted.
 
-## Prefetch
+## KGP ID Strategy
 
-Prefetch is best-effort and runs only when the current image is fully displayed (`Ready` indicator).
-The worker gives foreground requests a chance to preempt a prefetch right before encoding.
+`sivit` uses a single KGP ID per process (inspired by Yazi):
 
-See also: `CONTRIBUTING.md`.
+- The ID is generated at startup based on the process ID.
+- RGB components are ensured to be >= 16 to avoid terminal color quantization issues.
+- Before each transmit, `delete_by_id` clears any existing image data for this ID.
+
+This approach:
+- Avoids "wrong image" issues from stale terminal-side cache.
+- Simplifies cache management (no per-image ID tracking needed).
+
+## Transmit Sequence
+
+1. **Erase** old placement area (if any).
+2. **Delete** existing image data for this ID (`delete_by_id`).
+3. **Transmit** new image data (`encoded_chunks`).
+4. **Place** the image using Unicode placeholders.
+
+## Caching
+
+`sivit` uses a **client-side render cache** only:
+
+- **Render cache** (`render_cache` in `App`): Stores decoded/resized/encoded image data.
+- Size controlled by `SIVIT_RENDER_CACHE_SIZE` (default: 15).
+- LRU eviction when cache is full.
+
+The terminal-side cache is **not** relied upon. Each transmit starts with `delete_by_id` to ensure a clean slate. This trades some bandwidth for simplicity and correctness.

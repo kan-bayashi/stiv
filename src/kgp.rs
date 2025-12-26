@@ -22,12 +22,13 @@ pub fn delete_all(is_tmux: bool) -> Vec<u8> {
         ("\x1b", "\x1b", "")
     };
 
-    let mut buf = Vec::with_capacity(64);
+    let mut buf = Vec::with_capacity(128);
+    _ = write!(buf, "{start}_Gq=2,a=d,d=a{escape}\\{close}");
     _ = write!(buf, "{start}_Gq=2,a=d,d=A{escape}\\{close}");
     buf
 }
 
-pub fn delete_id(is_tmux: bool, id: u32) -> Vec<u8> {
+pub fn delete_by_id(id: u32, is_tmux: bool) -> Vec<u8> {
     let (start, escape, close) = if is_tmux {
         (TMUX_START, TMUX_ESCAPE, TMUX_CLOSE)
     } else {
@@ -41,20 +42,27 @@ pub fn delete_id(is_tmux: bool, id: u32) -> Vec<u8> {
 
 #[derive(Default)]
 pub struct KgpState {
-    last: Option<(Rect, u32)>,
+    last_area: Option<Rect>,
+    last_kgp_id: Option<u32>,
 }
 
 impl KgpState {
     pub fn last_area(&self) -> Option<Rect> {
-        self.last.map(|(area, _)| area)
+        self.last_area
     }
 
     pub fn last_kgp_id(&self) -> Option<u32> {
-        self.last.map(|(_, kgp_id)| kgp_id)
+        self.last_kgp_id
     }
 
     pub fn set_last(&mut self, area: Rect, kgp_id: u32) {
-        self.last = Some((area, kgp_id));
+        self.last_area = Some(area);
+        self.last_kgp_id = Some(kgp_id);
+    }
+
+    /// Invalidate kgp_id while preserving area (for erase_rows on next display).
+    pub fn invalidate(&mut self) {
+        self.last_kgp_id = None;
     }
 }
 
@@ -64,7 +72,12 @@ pub fn place_rows(area: Rect, id: u32) -> Vec<Vec<u8>> {
     }
 
     let mut rows = Vec::with_capacity(area.height as usize);
-    let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
+    let (id_extra, r, g, b) = (
+        (id >> 24) & 0xff,
+        (id >> 16) & 0xff,
+        (id >> 8) & 0xff,
+        id & 0xff,
+    );
 
     for y in 0..area.height {
         let mut buf = Vec::with_capacity(area.width as usize * 4 + 64);
@@ -81,6 +94,11 @@ pub fn place_rows(area: Rect, id: u32) -> Vec<Vec<u8>> {
                 buf,
                 "{}",
                 *DIACRITICS.get(x as usize).unwrap_or(&DIACRITICS[0])
+            );
+            _ = write!(
+                buf,
+                "{}",
+                *DIACRITICS.get(id_extra as usize).unwrap_or(&DIACRITICS[0])
             );
         }
         _ = write!(buf, "\x1b[0m");
@@ -148,10 +166,6 @@ pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>>
         buf.extend_from_slice(chunk);
         _ = write!(&mut buf, "{escape}\\{close}");
         chunks.push(buf);
-    }
-
-    if !close.is_empty() {
-        chunks.push(close.as_bytes().to_vec());
     }
 
     chunks
