@@ -58,18 +58,20 @@ pub struct App {
     pending_display: Option<Rect>,
     render_epoch: u64,
     clear_after_nav: bool,
+    is_tmux: bool,
 }
 
 pub fn is_tmux_env() -> bool {
     std::env::var_os("TMUX").is_some()
 }
 
-fn ensure_tmux_allow_passthrough_on() {
+fn ensure_tmux_allow_passthrough_on(is_tmux: bool) {
     use std::process::Command;
 
-    if is_tmux_env() {
+    if is_tmux {
+        // Use -pq to set pane-local option quietly (doesn't affect other panes/sessions)
         let _ = Command::new("tmux")
-            .args(["set-option", "-gq", "allow-passthrough", "on"])
+            .args(["set-option", "-pq", "allow-passthrough", "on"])
             .output();
     }
 }
@@ -77,7 +79,8 @@ fn ensure_tmux_allow_passthrough_on() {
 impl App {
     /// Create a new application instance.
     pub fn new(images: Vec<PathBuf>) -> Result<Self> {
-        ensure_tmux_allow_passthrough_on();
+        let is_tmux = is_tmux_env();
+        ensure_tmux_allow_passthrough_on(is_tmux);
 
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
         let render_cache_limit = render_cache_limit();
@@ -99,12 +102,13 @@ impl App {
             pending_display: None,
             render_epoch: 0,
             clear_after_nav: false,
+            is_tmux,
         };
 
         // Clear any stale terminal-side image cache at startup.
         app.writer.send(WriterRequest::ClearAll {
             area: None,
-            is_tmux: is_tmux_env(),
+            is_tmux,
         });
 
         Ok(app)
@@ -116,12 +120,13 @@ impl App {
     fn generate_kgp_id() -> u32 {
         const MIN_COMPONENT: u32 = 16;
         const MUL: u32 = 0x9E3779B1;
+        const MAX_ATTEMPTS: u32 = 10000;
 
         // Start from process ID to get some variation between instances
         let base = std::process::id();
         let mut idx = base;
 
-        loop {
+        for _ in 0..MAX_ATTEMPTS {
             let id = idx.wrapping_mul(MUL).rotate_left(8);
             let r = (id >> 16) & 0xff;
             let g = (id >> 8) & 0xff;
@@ -131,6 +136,10 @@ impl App {
             }
             idx = idx.wrapping_add(1);
         }
+
+        // Fallback: use a known-good ID if we couldn't find one
+        // This should never happen in practice, but provides safety
+        0x10_10_10_10
     }
 
     pub fn move_by(&mut self, delta: i32) {
@@ -173,18 +182,11 @@ impl App {
     }
 
     pub fn go_last(&mut self) {
-        if self.images.is_empty() {
-            return;
-        }
         self.go_to_index(self.images.len().saturating_sub(1));
     }
 
     pub fn go_to_1based(&mut self, n: usize) {
-        if self.images.is_empty() {
-            return;
-        }
-        let idx = n.saturating_sub(1);
-        self.go_to_index(idx);
+        self.go_to_index(n.saturating_sub(1));
     }
 
     fn invalidate_render(&mut self) {
@@ -195,6 +197,12 @@ impl App {
 
     fn current_path(&self) -> Option<&PathBuf> {
         self.images.get(self.current_index)
+    }
+
+    /// Compute image area from terminal size (excluding status bar).
+    fn image_area(terminal_size: Rect) -> Rect {
+        let full = Rect::new(0, 0, terminal_size.width, terminal_size.height);
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(full)[0]
     }
 
     pub fn poll_worker(&mut self) {
@@ -258,9 +266,7 @@ impl App {
             return StatusIndicator::Busy;
         };
 
-        let full = Rect::new(0, 0, terminal_size.width, terminal_size.height);
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(full);
-        let image_area = chunks[0];
+        let image_area = Self::image_area(terminal_size);
 
         let (cell_w, cell_h) = self.picker.font_size();
         if cell_w == 0 || cell_h == 0 || image_area.width == 0 || image_area.height == 0 {
@@ -324,17 +330,11 @@ impl App {
         let cancel_area = self.pending_display;
 
         self.writer.send(WriterRequest::CancelImage {
-            kgp_id: Some(self.kgp_id),
-            is_tmux: is_tmux_env(),
             area: cancel_area,
             epoch: self.render_epoch,
         });
         self.clear_after_nav = true;
-
-        if self.in_flight_transmit {
-            self.in_flight_transmit = false;
-        }
-
+        self.in_flight_transmit = false;
         self.pending_display = None;
         self.kgp_state.invalidate();
     }
@@ -353,12 +353,8 @@ impl App {
             return;
         }
 
-        let is_tmux = is_tmux_env();
         let old_area = self.kgp_state.last_area();
-
-        let full = Rect::new(0, 0, terminal_size.width, terminal_size.height);
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(full);
-        let image_area = chunks[0];
+        let image_area = Self::image_area(terminal_size);
 
         let (cell_w, cell_h) = self.picker.font_size();
         if cell_w == 0 || cell_h == 0 || image_area.width == 0 || image_area.height == 0 {
@@ -412,7 +408,7 @@ impl App {
             if self.clear_after_nav {
                 self.writer.send(WriterRequest::ClearAll {
                     area: None,
-                    is_tmux,
+                    is_tmux: self.is_tmux,
                 });
                 self.clear_after_nav = false;
             }
@@ -423,22 +419,23 @@ impl App {
                 kgp_id: self.kgp_id,
                 old_area,
                 epoch: self.render_epoch,
-                is_tmux,
+                is_tmux: self.is_tmux,
             });
             self.pending_display = Some(area);
             return;
         }
 
         // Request from worker if not already pending
-        if self.pending_request.as_ref() != Some(&(path.clone(), target, self.fit_mode)) {
+        let pending_key = (path, target, self.fit_mode);
+        if self.pending_request.as_ref() != Some(&pending_key) {
             self.worker.request(ImageRequest {
-                path: path.clone(),
+                path: pending_key.0.clone(),
                 target,
                 fit_mode: self.fit_mode,
                 kgp_id: self.kgp_id,
-                is_tmux,
+                is_tmux: self.is_tmux,
             });
-            self.pending_request = Some((path, target, self.fit_mode));
+            self.pending_request = Some(pending_key);
         }
     }
 
@@ -447,10 +444,9 @@ impl App {
             return;
         };
 
-        let is_tmux = is_tmux_env();
         self.writer.send(WriterRequest::ClearAll {
             area: Some(area),
-            is_tmux,
+            is_tmux: self.is_tmux,
         });
     }
 
@@ -476,7 +472,7 @@ impl App {
         }
 
         if std::env::var_os("SIVIT_DEBUG").is_some() {
-            if is_tmux_env() {
+            if self.is_tmux {
                 status.push_str(" tmux");
             }
             status.push_str(&format!(
@@ -515,6 +511,7 @@ mod tests {
             pending_display: None,
             render_epoch: 0,
             clear_after_nav: false,
+            is_tmux: false,
         }
     }
 

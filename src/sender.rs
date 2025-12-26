@@ -42,14 +42,6 @@ pub enum WriterRequest {
         epoch: u64,
         is_tmux: bool,
     },
-    #[allow(dead_code)]
-    /// Place a previously transmitted image in the terminal area.
-    ImagePlace {
-        area: Rect,
-        kgp_id: u32,
-        old_area: Option<Rect>,
-        epoch: u64,
-    },
     /// Clear any KGP overlays (used on shutdown).
     ClearAll {
         area: Option<Rect>,
@@ -57,8 +49,6 @@ pub enum WriterRequest {
     },
     /// Cancel an in-flight image task (best-effort).
     CancelImage {
-        kgp_id: Option<u32>,
-        is_tmux: bool,
         area: Option<Rect>,
         epoch: u64,
     },
@@ -73,7 +63,6 @@ pub struct WriterResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriterResultKind {
     TransmitDone { kgp_id: u32 },
-    PlaceDone { kgp_id: u32 },
 }
 
 struct Task {
@@ -81,6 +70,15 @@ struct Task {
     complete: Option<WriterResultKind>,
     epoch: u64,
     clears_dirty: bool,
+}
+
+struct WriterState {
+    should_quit: bool,
+    last_status: Option<(String, (u16, u16), StatusIndicator)>,
+    status_dirty: bool,
+    current_task: Option<Task>,
+    current_epoch: u64,
+    dirty_area: Option<Rect>,
 }
 
 pub struct TerminalWriter {
@@ -120,68 +118,50 @@ impl TerminalWriter {
         let mut out = stdout();
         let is_tty = out.is_terminal();
 
-        let mut last_status: Option<(String, (u16, u16), StatusIndicator)> = None;
-        let mut status_dirty = false;
-        let mut current_task: Option<Task> = None;
-        let mut current_epoch: u64 = 0;
-        let mut should_quit = false;
-        let mut dirty_area: Option<Rect> = None;
+        let mut state = WriterState {
+            should_quit: false,
+            last_status: None,
+            status_dirty: false,
+            current_task: None,
+            current_epoch: 0,
+            dirty_area: None,
+        };
         let mut bytes_since_flush: usize = 0;
         const FLUSH_THRESHOLD: usize = 64 * 1024;
 
         loop {
-            if should_quit {
+            if state.should_quit {
                 break;
             }
 
-            if current_task.is_none() && !status_dirty {
+            if state.current_task.is_none() && !state.status_dirty {
                 match request_rx.recv() {
-                    Ok(msg) => Self::apply_msg(
-                        msg,
-                        &mut should_quit,
-                        &mut last_status,
-                        &mut status_dirty,
-                        &mut current_task,
-                        is_tty,
-                        &mut out,
-                        &mut current_epoch,
-                        &mut dirty_area,
-                    ),
+                    Ok(msg) => Self::apply_msg(msg, &mut state, is_tty, &mut out),
                     Err(_) => break,
                 }
             }
 
             while let Ok(msg) = request_rx.try_recv() {
-                Self::apply_msg(
-                    msg,
-                    &mut should_quit,
-                    &mut last_status,
-                    &mut status_dirty,
-                    &mut current_task,
-                    is_tty,
-                    &mut out,
-                    &mut current_epoch,
-                    &mut dirty_area,
-                );
-                if should_quit {
+                Self::apply_msg(msg, &mut state, is_tty, &mut out);
+                if state.should_quit {
                     break;
                 }
             }
 
-            if status_dirty {
-                if let Some((text, size, indicator)) = last_status.clone() {
+            if state.status_dirty {
+                if let Some((text, size, indicator)) = state.last_status.clone() {
                     if is_tty {
                         let _ = Self::render_status(&mut out, &text, size, indicator);
                         let _ = out.flush();
                     }
                     bytes_since_flush = 0;
                 }
-                status_dirty = false;
+                state.status_dirty = false;
             }
 
-            if let Some(task) = &mut current_task {
-                if task.epoch != current_epoch {
-                    current_task = None;
+            if let Some(task) = &mut state.current_task {
+                if task.epoch != state.current_epoch {
+                    state.current_task = None;
                     continue;
                 }
                 if !is_tty {
@@ -192,9 +172,9 @@ impl TerminalWriter {
                         });
                     }
                     if task.clears_dirty {
-                        dirty_area = None;
+                        state.dirty_area = None;
                     }
-                    current_task = None;
+                    state.current_task = None;
                     continue;
                 }
                 if let Some(chunk) = task.chunks.pop_front() {
@@ -216,77 +196,51 @@ impl TerminalWriter {
                         });
                     }
                     if task.clears_dirty {
-                        dirty_area = None;
+                        state.dirty_area = None;
                     }
-                    current_task = None;
+                    state.current_task = None;
                 }
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn apply_msg(
-        msg: WriterRequest,
-        should_quit: &mut bool,
-        last_status: &mut Option<(String, (u16, u16), StatusIndicator)>,
-        status_dirty: &mut bool,
-        current_task: &mut Option<Task>,
-        is_tty: bool,
-        out: &mut impl Write,
-        current_epoch: &mut u64,
-        dirty_area: &mut Option<Rect>,
-    ) {
+    fn apply_msg(msg: WriterRequest, state: &mut WriterState, is_tty: bool, out: &mut impl Write) {
         match msg {
             WriterRequest::Shutdown => {
-                *should_quit = true;
+                state.should_quit = true;
             }
             WriterRequest::Status {
                 text,
                 size,
                 indicator,
             } => {
-                *last_status = Some((text, size, indicator));
-                *status_dirty = true;
+                state.last_status = Some((text, size, indicator));
+                state.status_dirty = true;
             }
             WriterRequest::ClearAll { area, is_tmux } => {
                 // Preempt current image work.
-                *current_task = None;
-                *dirty_area = None;
+                state.current_task = None;
+                state.dirty_area = None;
                 if is_tty {
                     let _ = Self::clear_all(out, area, is_tmux);
                     let _ = out.flush();
                 }
             }
-            WriterRequest::CancelImage {
-                kgp_id,
-                is_tmux,
-                area,
-                epoch,
-            } => {
-                if epoch >= *current_epoch {
-                    *current_epoch = epoch;
-                    *current_task = None;
+            WriterRequest::CancelImage { area, epoch } => {
+                if epoch >= state.current_epoch {
+                    state.current_epoch = epoch;
+                    state.current_task = None;
                 }
                 if let Some(cancel_area) = area {
-                    let next = match dirty_area.take() {
+                    let next = match state.dirty_area.take() {
                         Some(prev) => union_rect(prev, cancel_area),
                         None => cancel_area,
                     };
-                    *dirty_area = Some(next);
+                    state.dirty_area = Some(next);
                 }
+                // Cancellation is best-effort: just stop writing further chunks.
+                // task_transmit always erases old_area to clean up stale placements.
                 if is_tty {
-                    // Do not delete ids here: it's racy (the transmit may already have completed)
-                    // and can lead to "Ready but not displayed" until a resize forces a re-send.
-                    //
-                    // Cancellation is best-effort: stop writing further chunks so status updates
-                    // remain responsive.
-                    //
-                    // Note: We do NOT erase here. Erasing on cancel causes blank screen when
-                    // navigation resumes before a new ImagePlace is sent (navigation latch).
-                    // Instead, task_place/task_transmit always erase old_area to clean up.
-                    let _ = kgp_id;
-                    let _ = is_tmux;
-                    let _ = area;
                     let _ = out.write_all(b"\x1b[0m");
                     let _ = out.flush();
                 }
@@ -299,12 +253,12 @@ impl TerminalWriter {
                 epoch,
                 is_tmux,
             } => {
-                if epoch < *current_epoch {
+                if epoch < state.current_epoch {
                     return;
                 }
-                *current_epoch = epoch;
-                let cleanup_area = *dirty_area;
-                *current_task = Some(Self::task_transmit(
+                state.current_epoch = epoch;
+                let cleanup_area = state.dirty_area;
+                state.current_task = Some(Self::task_transmit(
                     encoded_chunks,
                     area,
                     kgp_id,
@@ -314,59 +268,6 @@ impl TerminalWriter {
                     is_tmux,
                 ));
             }
-            WriterRequest::ImagePlace {
-                area,
-                kgp_id,
-                old_area,
-                epoch,
-            } => {
-                if epoch < *current_epoch {
-                    return;
-                }
-                *current_epoch = epoch;
-                let cleanup_area = *dirty_area;
-                *current_task = Some(Self::task_place(
-                    area,
-                    kgp_id,
-                    old_area,
-                    cleanup_area,
-                    epoch,
-                ));
-            }
-        }
-    }
-
-    fn task_place(
-        area: Rect,
-        kgp_id: u32,
-        old_area: Option<Rect>,
-        dirty_area: Option<Rect>,
-        epoch: u64,
-    ) -> Task {
-        let mut chunks = VecDeque::new();
-
-        // Step 1: Erase old area FIRST (yazi pattern: hide -> show)
-        if let Some(old) = old_area {
-            for row in erase_rows(old) {
-                chunks.push_back(row);
-            }
-        }
-        for cleanup in Self::cleanup_rects(area, None, dirty_area) {
-            for row in erase_rows(cleanup) {
-                chunks.push_back(row);
-            }
-        }
-
-        // Step 2: Place new image
-        for row in place_rows(area, kgp_id) {
-            chunks.push_back(row);
-        }
-
-        Task {
-            chunks,
-            complete: Some(WriterResultKind::PlaceDone { kgp_id }),
-            epoch,
-            clears_dirty: dirty_area.is_some(),
         }
     }
 
@@ -388,7 +289,7 @@ impl TerminalWriter {
                 chunks.push_back(row);
             }
         }
-        for cleanup in Self::cleanup_rects(area, None, dirty_area) {
+        for cleanup in Self::cleanup_rects(area, dirty_area) {
             for row in erase_rows(cleanup) {
                 chunks.push_back(row);
             }
@@ -416,15 +317,11 @@ impl TerminalWriter {
         }
     }
 
-    fn cleanup_rects(area: Rect, old_area: Option<Rect>, dirty_area: Option<Rect>) -> Vec<Rect> {
-        let mut out = Vec::new();
-        if let Some(old) = old_area {
-            out.extend(rect_diff(old, area));
+    fn cleanup_rects(area: Rect, dirty_area: Option<Rect>) -> Vec<Rect> {
+        match dirty_area {
+            Some(dirty) => rect_diff(dirty, area),
+            None => Vec::new(),
         }
-        if let Some(dirty) = dirty_area {
-            out.extend(rect_diff(dirty, area));
-        }
-        out
     }
 
     fn clear_all(out: &mut impl Write, area: Option<Rect>, is_tmux: bool) -> std::io::Result<()> {
@@ -584,4 +481,156 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
     let y1 = ay1.max(by1);
 
     Rect::new(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rect_intersection_no_overlap() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(20, 20, 10, 10);
+        assert!(rect_intersection(a, b).is_none());
+    }
+
+    #[test]
+    fn test_rect_intersection_partial() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(5, 5, 10, 10);
+        let inter = rect_intersection(a, b).unwrap();
+        assert_eq!(inter, Rect::new(5, 5, 5, 5));
+    }
+
+    #[test]
+    fn test_rect_intersection_contained() {
+        let a = Rect::new(0, 0, 20, 20);
+        let b = Rect::new(5, 5, 5, 5);
+        let inter = rect_intersection(a, b).unwrap();
+        assert_eq!(inter, Rect::new(5, 5, 5, 5));
+    }
+
+    #[test]
+    fn test_rect_intersection_same() {
+        let a = Rect::new(5, 5, 10, 10);
+        let inter = rect_intersection(a, a).unwrap();
+        assert_eq!(inter, a);
+    }
+
+    #[test]
+    fn test_rect_intersection_edge_touch() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(10, 0, 10, 10);
+        // Edge touch means no overlap (width/height would be 0)
+        assert!(rect_intersection(a, b).is_none());
+    }
+
+    #[test]
+    fn test_rect_diff_no_overlap() {
+        let old = Rect::new(0, 0, 10, 10);
+        let new = Rect::new(20, 20, 10, 10);
+        let diff = rect_diff(old, new);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0], old);
+    }
+
+    #[test]
+    fn test_rect_diff_same_rect() {
+        let r = Rect::new(5, 5, 10, 10);
+        let diff = rect_diff(r, r);
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_rect_diff_partial_overlap() {
+        // old covers (0,0)-(10,10), new covers (5,5)-(15,15)
+        let old = Rect::new(0, 0, 10, 10);
+        let new = Rect::new(5, 5, 10, 10);
+        let diff = rect_diff(old, new);
+        // Should produce strips: top, left
+        assert!(!diff.is_empty());
+        // Total area of diff should equal old area - intersection area
+        let diff_area: u32 = diff
+            .iter()
+            .map(|r| u32::from(r.width) * u32::from(r.height))
+            .sum();
+        let old_area = 10 * 10;
+        let inter_area = 5 * 5;
+        assert_eq!(diff_area, old_area - inter_area);
+    }
+
+    #[test]
+    fn test_rect_diff_new_inside_old() {
+        let old = Rect::new(0, 0, 20, 20);
+        let new = Rect::new(5, 5, 10, 10);
+        let diff = rect_diff(old, new);
+        // Should produce 4 strips around the new rect
+        assert_eq!(diff.len(), 4);
+    }
+
+    #[test]
+    fn test_union_rect_disjoint() {
+        let a = Rect::new(0, 0, 5, 5);
+        let b = Rect::new(10, 10, 5, 5);
+        let u = union_rect(a, b);
+        assert_eq!(u, Rect::new(0, 0, 15, 15));
+    }
+
+    #[test]
+    fn test_union_rect_overlapping() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(5, 5, 10, 10);
+        let u = union_rect(a, b);
+        assert_eq!(u, Rect::new(0, 0, 15, 15));
+    }
+
+    #[test]
+    fn test_union_rect_same() {
+        let r = Rect::new(5, 5, 10, 10);
+        let u = union_rect(r, r);
+        assert_eq!(u, r);
+    }
+
+    #[test]
+    fn test_union_rect_contained() {
+        let outer = Rect::new(0, 0, 20, 20);
+        let inner = Rect::new(5, 5, 5, 5);
+        let u = union_rect(outer, inner);
+        assert_eq!(u, outer);
+    }
+
+    #[test]
+    fn test_clip_utf8_no_truncation() {
+        let s = "hello";
+        assert_eq!(clip_utf8(s, 10), "hello");
+    }
+
+    #[test]
+    fn test_clip_utf8_exact_fit() {
+        let s = "hello";
+        assert_eq!(clip_utf8(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_clip_utf8_truncation() {
+        let s = "hello world";
+        assert_eq!(clip_utf8(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_clip_utf8_multibyte() {
+        let s = "日本語テスト";
+        // Each Japanese character is 3 bytes
+        // 6 bytes = 2 chars
+        let clipped = clip_utf8(s, 6);
+        assert_eq!(clipped, "日本");
+    }
+
+    #[test]
+    fn test_clip_utf8_multibyte_boundary() {
+        let s = "日本語";
+        // 7 bytes: can fit 2 chars (6 bytes), not 3rd partial
+        let clipped = clip_utf8(s, 7);
+        assert_eq!(clipped, "日本");
+    }
 }
