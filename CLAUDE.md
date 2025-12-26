@@ -18,8 +18,7 @@ sivit (Simple Image Viewer In Terminal) - A terminal-based image viewer with sxi
 sivit/
 ├── Cargo.toml
 ├── docs/
-│   ├── architecture.md
-│   └── development.md
+│   └── architecture.md
 ├── src/
 │   ├── main.rs    # Entry point, CLI parsing, event loop
 │   ├── app.rs     # App state, navigation, cache orchestration
@@ -53,7 +52,7 @@ cargo clippy         # Lint
 ## Environment Variables
 
 - `SIVIT_NAV_LATCH_MS` - Navigation latch (ms) before drawing images (default: 150)
-- `SIVIT_RENDER_CACHE_SIZE` - Render cache entries (default: 15)
+- `SIVIT_RENDER_CACHE_SIZE` - Client-side render cache size (encoded images in memory, default: 15)
 - `SIVIT_TMUX_KITTY_MAX_PIXELS` - Max pixels for tmux+kitty in `Normal` mode (default: 1500000)
 - `SIVIT_FORCE_ALT_SCREEN` - Force alternate screen mode
 - `SIVIT_NO_ALT_SCREEN` - Disable alternate screen mode
@@ -74,12 +73,18 @@ cargo clippy         # Lint
   - KGP chunk boundaries for transmit (`encode_chunks`)
   - per-row boundaries for placement/erase (`place_rows` / `erase_rows`)
 - **Navigation must stay responsive**
-  - cancel in-flight image output on navigation
+  - cancel in-flight image output on navigation (only when not transmitting)
   - avoid blocking the main loop on decode/encode or stdout I/O
+- **Single KGP ID per process**
+  - `delete_by_id` before each transmit to clear terminal-side cache
+  - prevents "wrong image" and "blank screen" issues
+- **Transmit must complete once started**
+  - skip cancellation during active transmission (`is_transmitting()`)
+  - ensures terminal receives complete image data
 
 ## Architecture Notes
 
-- See `docs/architecture.md` and `docs/development.md`.
+- See `docs/architecture.md`.
 
 ## Contributing
 

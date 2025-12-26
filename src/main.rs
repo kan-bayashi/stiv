@@ -246,8 +246,7 @@ fn run(images: Vec<PathBuf>) -> Result<()> {
         }
 
         // Prepare image render request (non-blocking, sends to sender thread).
-        // - Cached images (transmitted=true): always display instantly (fast, just placement)
-        // - New images (transmitted=false): only transmit after user stops navigating (debounce)
+        // Transmits only after user stops navigating (debounce via nav_latch).
         app.prepare_render_request(terminal_rect, allow_transmission);
 
         // Wait for next event or worker result.

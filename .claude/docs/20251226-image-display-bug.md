@@ -206,6 +206,25 @@ Yazi は画像操作を可能な限り atomic に行う。途中で中断され�
 - `src/kgp.rs` - `delete_by_id()` 関数追加
 - `src/main.rs` - 送信中キャンセルスキップ
 
+## クリーンアップ / Post-fix Cleanup
+
+修正完了後、不要になった端末側キャッシュ関連のロジックを削除:
+
+### 削除した項目
+- `RenderedImage.transmitted` - 送信済みフラグ
+- `RenderedImage.last_transmit_seq` - 最後の送信シーケンス
+- `App.transmit_seq` - グローバル送信カウンタ
+- `App.force_retransmit` - 強制再送フラグ
+- `App.should_retransmit()` - 再送判定メソッド
+- `App.should_retransmit_with_seq()` - 再送判定メソッド
+
+### 理由
+`delete_by_id` を毎回呼ぶようになったため、端末側キャッシュの再利用は不可能に。
+これらのロジックは元々「端末側に画像データが残っていれば place だけで済む」という最適化のためのものだったが、シングル ID + delete_by_id 方式ではこの最適化が成立しない。
+
+### 残したもの
+- `render_cache_limit` / `SIVIT_RENDER_CACHE_SIZE` - クライアント側メモリキャッシュのサイズ制限
+
 ## ステータス / Status
 
 **解決済み** (2025-12-26)

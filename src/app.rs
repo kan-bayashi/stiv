@@ -28,8 +28,6 @@ pub struct RenderedImage {
     pub fit_mode: FitMode,
     pub actual_size: (u32, u32),
     pub encoded_chunks: Vec<Vec<u8>>,
-    pub transmitted: bool,
-    pub last_transmit_seq: u64,
 }
 
 fn render_cache_limit() -> usize {
@@ -59,8 +57,6 @@ pub struct App {
     in_flight_transmit: bool,
     pending_display: Option<Rect>,
     render_epoch: u64,
-    transmit_seq: u64,
-    force_retransmit: bool,
     clear_after_nav: bool,
 }
 
@@ -102,8 +98,6 @@ impl App {
             in_flight_transmit: false,
             pending_display: None,
             render_epoch: 0,
-            transmit_seq: 0,
-            force_retransmit: false,
             clear_after_nav: false,
         };
 
@@ -203,18 +197,6 @@ impl App {
         self.images.get(self.current_index)
     }
 
-    fn should_retransmit(&self, rendered: &RenderedImage) -> bool {
-        self.should_retransmit_with_seq(rendered.transmitted, rendered.last_transmit_seq)
-    }
-
-    fn should_retransmit_with_seq(&self, transmitted: bool, last_transmit_seq: u64) -> bool {
-        if !transmitted {
-            return true;
-        }
-        let limit = self.render_cache_limit.max(1) as u64;
-        self.transmit_seq.saturating_sub(last_transmit_seq) >= limit
-    }
-
     pub fn poll_worker(&mut self) {
         while let Some(result) = self.worker.try_recv() {
             if self.pending_request.as_ref().is_some_and(|(p, t, f)| {
@@ -237,8 +219,6 @@ impl App {
                 fit_mode: result.fit_mode,
                 actual_size: result.actual_size,
                 encoded_chunks: result.encoded_chunks,
-                transmitted: false,
-                last_transmit_seq: 0,
             });
         }
     }
@@ -248,21 +228,7 @@ impl App {
             if result.epoch != self.render_epoch {
                 continue;
             }
-            let transmitted = matches!(result.kind, WriterResultKind::TransmitDone { .. });
-
-            if transmitted {
-                self.transmit_seq = self.transmit_seq.saturating_add(1);
-                let seq = self.transmit_seq;
-                // Mark current image as transmitted in cache
-                if let Some(path) = self.current_path().cloned() {
-                    for rendered in &mut self.render_cache {
-                        if rendered.path == path {
-                            rendered.transmitted = true;
-                            rendered.last_transmit_seq = seq;
-                            break;
-                        }
-                    }
-                }
+            if matches!(result.kind, WriterResultKind::TransmitDone { .. }) {
                 self.in_flight_transmit = false;
             }
 
@@ -285,9 +251,6 @@ impl App {
             return StatusIndicator::Busy;
         }
         if self.in_flight_transmit {
-            return StatusIndicator::Busy;
-        }
-        if self.force_retransmit {
             return StatusIndicator::Busy;
         }
 
@@ -315,10 +278,6 @@ impl App {
         else {
             return StatusIndicator::Busy;
         };
-
-        if self.should_retransmit(rendered) {
-            return StatusIndicator::Busy;
-        }
 
         // Compute expected placement area and require it to match last successful display.
         let cells_w = rendered.actual_size.0.div_ceil(u32::from(cell_w));
@@ -370,19 +329,9 @@ impl App {
             area: cancel_area,
             epoch: self.render_epoch,
         });
-        self.force_retransmit = true;
         self.clear_after_nav = true;
 
-        // Invalidate current image's transmitted status if we were transmitting
         if self.in_flight_transmit {
-            if let Some(path) = self.current_path().cloned() {
-                for rendered in &mut self.render_cache {
-                    if rendered.path == path {
-                        rendered.transmitted = false;
-                        break;
-                    }
-                }
-            }
             self.in_flight_transmit = false;
         }
 
@@ -426,18 +375,10 @@ impl App {
             .iter()
             .position(|r| r.path == path && r.target == target && r.fit_mode == self.fit_mode);
         if let Some(idx) = cached_idx {
-            let (actual_size, encoded_chunks, transmitted, last_transmit_seq) = {
+            let (actual_size, encoded_chunks) = {
                 let rendered = &self.render_cache[idx];
-                (
-                    rendered.actual_size,
-                    rendered.encoded_chunks.clone(),
-                    rendered.transmitted,
-                    rendered.last_transmit_seq,
-                )
+                (rendered.actual_size, rendered.encoded_chunks.clone())
             };
-            let force_retransmit = self.force_retransmit;
-            let retransmit =
-                self.should_retransmit_with_seq(transmitted, last_transmit_seq) || force_retransmit;
 
             // Calculate area for placement based on actual image size
             let cells_w = actual_size.0.div_ceil(u32::from(cell_w));
@@ -453,10 +394,9 @@ impl App {
                 cells_h,
             );
 
-            // Skip if already displayed and a refresh is not needed.
+            // Skip if already displayed.
             if self.kgp_state.last_area() == Some(area)
                 && self.kgp_state.last_kgp_id() == Some(self.kgp_id)
-                && !retransmit
             {
                 return;
             }
@@ -469,7 +409,6 @@ impl App {
                 return;
             }
             self.in_flight_transmit = true;
-            self.force_retransmit = false;
             if self.clear_after_nav {
                 self.writer.send(WriterRequest::ClearAll {
                     area: None,
@@ -575,8 +514,6 @@ mod tests {
             in_flight_transmit: false,
             pending_display: None,
             render_epoch: 0,
-            transmit_seq: 0,
-            force_retransmit: false,
             clear_after_nav: false,
         }
     }
@@ -657,8 +594,6 @@ mod tests {
             fit_mode: FitMode::Normal,
             actual_size: (1, 1),
             encoded_chunks: vec![b"x".to_vec()],
-            transmitted: true,
-            last_transmit_seq: 1,
         });
         app.pending_request = Some((PathBuf::from("y.png"), (1, 1), FitMode::Normal));
         app.in_flight_transmit = true;
