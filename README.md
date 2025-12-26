@@ -2,7 +2,7 @@
 
 **S**imple **I**mage **V**iewer **I**n **T**erminal
 
-A terminal-based image viewer with sxiv-like keybindings. Works over SSH.
+A terminal-based image viewer with sxiv-like keybindings. Works over SSH with Tmux.
 
 ![](./samples/sivit.png)
 
