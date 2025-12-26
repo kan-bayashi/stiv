@@ -2,9 +2,9 @@
 
 **S**imple **V**iewer in **T**erminal
 
-A blazing fast terminal image viewer written in Rust with sxiv-like keybindings. Works over SSH with Tmux.
+A minimal & fast terminal image viewer written in Rust with sxiv-like keybindings. Works over SSH with Tmux.
 
-![](./samples/svt.png)
+![](./assets/demo.gif)
 
 ## Features
 
@@ -15,11 +15,15 @@ A blazing fast terminal image viewer written in Rust with sxiv-like keybindings.
 
 ## Requirements
 
-- Kitty Graphics Protocol supported terminal
-- Optional: tmux (uses `allow-passthrough=on`, `svt` attempts to set it automatically)
-- Rust 1.75+
+**Supported Terminals:**
+- [Ghostty](https://ghostty.org/) (Recommended)
+- [Kitty](https://sw.kovidgoyal.net/kitty/)
+- [WezTerm](https://wezfurlong.org/wezterm/)
+- Other terminals with [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) support
 
-Tested: Ghostty + tmux.
+**tmux:** Works with tmux. Passthrough is enabled automatically.
+
+**Building from source:** Rust 1.75+ required.
 
 ## Installation
 
