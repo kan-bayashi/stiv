@@ -5,9 +5,10 @@ The core goal is: keep navigation/status updates responsive even when image rend
 
 ## High-level pipeline
 
-There are three concurrent “lanes”:
+There are three concurrent "lanes":
 
 1. **Main thread** (`src/main.rs`)
+   - Loads configuration (`src/config.rs`).
    - Reads key events.
    - Updates application state.
    - Decides when to request rendering.
@@ -78,7 +79,42 @@ This approach:
 `svt` uses a **client-side render cache** only:
 
 - **Render cache** (`render_cache` in `App`): Stores decoded/resized/encoded image data.
-- Size controlled by `SVT_RENDER_CACHE_SIZE` (default: 15).
+- Size controlled by `render_cache_size` config (default: 100).
 - LRU eviction when cache is full.
 
 The terminal-side cache is **not** relied upon. Each transmit starts with `delete_by_id` to ensure a clean slate. This trades some bandwidth for simplicity and correctness.
+
+## Configuration
+
+Settings are loaded at startup by `Config::load()` (`src/config.rs`):
+
+1. Load from `~/.config/svt/config.toml` (if exists).
+2. Override with environment variables (`SVT_*`).
+3. Apply defaults for missing values.
+
+**Priority:** Environment variables > Config file > Defaults
+
+The `Config` struct is passed to `App` and propagated to worker requests as needed.
+
+## Invariants
+
+These invariants must be preserved when modifying the codebase:
+
+1. **stdout via `TerminalWriter` only** (`src/sender.rs`)
+   - No other component may write to stdout directly.
+
+2. **Image output chunked at safe boundaries**
+   - KGP chunk boundaries for transmit (`encode_chunks`)
+   - Per-row boundaries for placement/erase (`place_rows` / `erase_rows`)
+
+3. **Navigation stays responsive**
+   - Cancel in-flight image output on navigation (except during transmit)
+   - Avoid blocking the main loop on decode/encode or stdout I/O
+
+4. **Single KGP ID per process**
+   - `delete_by_id` before each transmit to clear terminal-side cache
+   - Prevents "wrong image" and "blank screen" issues
+
+5. **Transmit must complete once started**
+   - Skip cancellation during active transmission (`is_transmitting()`)
+   - Ensures terminal receives complete image data
