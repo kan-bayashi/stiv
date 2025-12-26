@@ -249,6 +249,11 @@ fn run(images: Vec<PathBuf>) -> Result<()> {
         // Transmits only after user stops navigating (debounce via nav_latch).
         app.prepare_render_request(terminal_rect, allow_transmission);
 
+        // Prefetch adjacent images after current image is fully displayed.
+        if allow_transmission && indicator == crate::sender::StatusIndicator::Ready {
+            app.prefetch_adjacent(terminal_rect);
+        }
+
         // Wait for next event or worker result.
         // While navigating, keep the loop tighter so the status bar feels immediate.
         let tick = if is_navigating {

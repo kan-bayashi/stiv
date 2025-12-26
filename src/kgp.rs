@@ -128,8 +128,16 @@ pub fn erase_rows(area: Rect) -> Vec<Vec<u8>> {
     rows
 }
 
-fn use_zlib_compression() -> bool {
-    std::env::var_os("SIVIT_KGP_NO_COMPRESS").is_none()
+fn compression_level() -> Option<u32> {
+    if std::env::var_os("SIVIT_KGP_NO_COMPRESS").is_some() {
+        return None;
+    }
+    let level = std::env::var("SIVIT_COMPRESS_LEVEL")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(6)
+        .min(9);
+    Some(level)
 }
 
 pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>> {
@@ -141,11 +149,11 @@ pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>>
         v => (v.clone().into_rgb8().as_raw().clone(), 24),
     };
 
-    let use_zlib = use_zlib_compression();
-    let data = if use_zlib {
+    let compress_level = compression_level();
+    let data = if let Some(level) = compress_level {
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
         let _ = encoder.write_all(&raw);
         encoder.finish().unwrap_or(raw)
     } else {
@@ -163,7 +171,7 @@ pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>>
         ("\x1b", "\x1b", "")
     };
 
-    let compression_opt = if use_zlib { ",o=z" } else { "" };
+    let compression_opt = if compress_level.is_some() { ",o=z" } else { "" };
 
     if let Some(first) = it.next() {
         let mut buf = Vec::with_capacity(first.len() + 128);

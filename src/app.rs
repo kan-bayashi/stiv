@@ -32,8 +32,8 @@ pub struct RenderedImage {
 }
 
 fn render_cache_limit() -> usize {
-    const DEFAULT: usize = 15;
-    const MAX: usize = 200;
+    const DEFAULT: usize = 100;
+    const MAX: usize = 500;
 
     std::env::var("SIVIT_RENDER_CACHE_SIZE")
         .ok()
@@ -438,6 +438,76 @@ impl App {
                 is_tmux: self.is_tmux,
             });
             self.pending_request = Some(pending_key);
+        }
+    }
+
+    fn prefetch_count() -> usize {
+        std::env::var("SIVIT_PREFETCH_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5)
+    }
+
+    /// Prefetch adjacent images (next and previous) into the render cache.
+    /// Call this after the current image is fully displayed.
+    pub fn prefetch_adjacent(&mut self, terminal_size: Rect) {
+        // Skip if there's already a pending request (don't overwhelm the worker)
+        if self.pending_request.is_some() {
+            return;
+        }
+
+        let prefetch_count = Self::prefetch_count();
+        if prefetch_count == 0 {
+            return;
+        }
+
+        let image_area = Self::image_area(terminal_size);
+        let (cell_w, cell_h) = self.picker.font_size();
+        if cell_w == 0 || cell_h == 0 || image_area.width == 0 || image_area.height == 0 {
+            return;
+        }
+
+        let max_w_px = u32::from(image_area.width) * u32::from(cell_w);
+        let max_h_px = u32::from(image_area.height) * u32::from(cell_h);
+        let target = (max_w_px, max_h_px);
+
+        // Try to prefetch next and previous images
+        let len = self.images.len();
+        if len <= 1 {
+            return;
+        }
+
+        // Build list of indices to prefetch: next N, then prev N
+        let mut indices = Vec::with_capacity(prefetch_count * 2);
+        for i in 1..=prefetch_count {
+            indices.push((self.current_index + i) % len); // next
+        }
+        for i in 1..=prefetch_count {
+            indices.push((self.current_index + len - i) % len); // prev
+        }
+
+        for idx in indices {
+            let path = &self.images[idx];
+
+            // Skip if already in cache
+            let in_cache = self
+                .render_cache
+                .iter()
+                .any(|r| &r.path == path && r.target == target && r.fit_mode == self.fit_mode);
+            if in_cache {
+                continue;
+            }
+
+            // Send prefetch request
+            self.worker.request(ImageRequest {
+                path: path.clone(),
+                target,
+                fit_mode: self.fit_mode,
+                kgp_id: self.kgp_id,
+                is_tmux: self.is_tmux,
+            });
+            // Only prefetch one at a time to avoid overwhelming the worker
+            break;
         }
     }
 

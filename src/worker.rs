@@ -128,7 +128,7 @@ impl ImageWorker {
                 let max_pixels: u64 = std::env::var("SIVIT_TMUX_KITTY_MAX_PIXELS")
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(1_500_000);
+                    .unwrap_or(2_000_000);
                 let target_pixels = (target_w as u64).saturating_mul(target_h as u64);
                 if target_pixels > max_pixels {
                     let down = (max_pixels as f64 / target_pixels as f64).sqrt();
