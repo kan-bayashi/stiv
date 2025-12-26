@@ -52,13 +52,15 @@ cargo clippy         # Lint
 ## Environment Variables
 
 - `SIVIT_NAV_LATCH_MS` - Navigation latch (ms) before drawing images (default: 150)
-- `SIVIT_RENDER_CACHE_SIZE` - Client-side render cache size (encoded images in memory, default: 15)
-- `SIVIT_TMUX_KITTY_MAX_PIXELS` - Max pixels for tmux+kitty in `Normal` mode (default: 1500000)
+- `SIVIT_RENDER_CACHE_SIZE` - Client-side render cache size (encoded images in memory, default: 100)
+- `SIVIT_TMUX_KITTY_MAX_PIXELS` - Max pixels for tmux+kitty in `Normal` mode (default: 2000000)
 - `SIVIT_FORCE_ALT_SCREEN` - Force alternate screen mode
 - `SIVIT_NO_ALT_SCREEN` - Disable alternate screen mode
 - `SIVIT_DEBUG` - Enable debug info in status bar
 - `SIVIT_TRACE_WORKER` - Write worker timing logs to `/tmp/sivit_worker.log`
 - `SIVIT_KGP_NO_COMPRESS` - Disable zlib compression for KGP transmission
+- `SIVIT_COMPRESS_LEVEL` - Zlib compression level 0-9 (default: 6, higher = smaller but slower)
+- `SIVIT_PREFETCH_COUNT` - Number of images to prefetch ahead/behind (default: 5)
 
 ## Coding Conventions
 
