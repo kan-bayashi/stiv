@@ -1,6 +1,6 @@
 <div align="center">
 
-# ✨ SVT - Simple Viewer in Terminal ✨
+# ✨ **SVT** - **S**imple image **V**iewer in **T**erminal ✨
 
 *A minimal & fast terminal image viewer written in Rust with sxiv-like keybindings*
 
