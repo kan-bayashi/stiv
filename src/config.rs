@@ -25,6 +25,8 @@ pub struct Config {
     pub tmux_kitty_max_pixels: u64,
     pub trace_worker: bool,
     pub cell_aspect_ratio: f64,
+    pub resize_filter: String,
+    pub tile_filter: String,
 }
 
 impl Default for Config {
@@ -41,7 +43,22 @@ impl Default for Config {
             tmux_kitty_max_pixels: 2_000_000,
             trace_worker: false,
             cell_aspect_ratio: 2.0,
+            resize_filter: "triangle".to_string(),
+            tile_filter: "nearest".to_string(),
         }
+    }
+}
+
+/// Parse filter type string to image::imageops::FilterType.
+/// Returns Triangle as fallback for invalid values.
+pub fn parse_filter_type(s: &str) -> image::imageops::FilterType {
+    match s.to_lowercase().as_str() {
+        "nearest" => image::imageops::FilterType::Nearest,
+        "triangle" => image::imageops::FilterType::Triangle,
+        "catmullrom" | "catmull-rom" => image::imageops::FilterType::CatmullRom,
+        "gaussian" => image::imageops::FilterType::Gaussian,
+        "lanczos3" | "lanczos" => image::imageops::FilterType::Lanczos3,
+        _ => image::imageops::FilterType::Triangle,
     }
 }
 
@@ -97,6 +114,12 @@ impl Config {
         }
         if let Some(v) = Self::parse_env::<f64>("SVT_CELL_ASPECT_RATIO") {
             self.cell_aspect_ratio = v;
+        }
+        if let Ok(v) = std::env::var("SVT_RESIZE_FILTER") {
+            self.resize_filter = v;
+        }
+        if let Ok(v) = std::env::var("SVT_TILE_FILTER") {
+            self.tile_filter = v;
         }
     }
 

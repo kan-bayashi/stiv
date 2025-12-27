@@ -29,11 +29,14 @@ pub struct ImageRequest {
     pub compress_level: Option<u32>,
     pub tmux_kitty_max_pixels: u64,
     pub trace_worker: bool,
+    // Resize filter for Single mode
+    pub resize_filter: image::imageops::FilterType,
     // Tile mode fields
     pub view_mode: ViewMode,
     pub tile_paths: Option<Vec<PathBuf>>,
     pub tile_grid: Option<(usize, usize)>,
     pub cell_size: Option<(u16, u16)>, // (width, height) in pixels for padding calculation
+    pub tile_filter: image::imageops::FilterType,
 }
 
 pub struct ImageResult {
@@ -173,7 +176,7 @@ impl ImageWorker {
         use std::borrow::Cow;
         let resize_start = std::time::Instant::now();
         let resized: Cow<'_, DynamicImage> = if target_w != orig_w || target_h != orig_h {
-            Cow::Owned(decoded.thumbnail(target_w, target_h))
+            Cow::Owned(decoded.resize(target_w, target_h, req.resize_filter))
         } else {
             Cow::Borrowed(&*decoded)
         };
@@ -246,6 +249,7 @@ impl ImageWorker {
             grid,
             req.target,
             req.cell_size,
+            req.tile_filter,
             req.trace_worker,
         ) else {
             return;
@@ -308,14 +312,17 @@ impl ImageWorker {
     }
 
     /// Composite multiple images into a single tile grid image (without cursor).
+    /// Uses parallel processing for decode and resize operations.
     fn composite_tile_images(
         paths: &[PathBuf],
         grid: (usize, usize),
         canvas_size: (u32, u32),
         cell_size: Option<(u16, u16)>,
+        filter: image::imageops::FilterType,
         trace_worker: bool,
     ) -> Option<(DynamicImage, (u32, u32))> {
         use image::{GenericImage, Rgba, RgbaImage};
+        use rayon::prelude::*;
 
         let (cols, rows) = grid;
         let (canvas_w, canvas_h) = canvas_size;
@@ -335,74 +342,79 @@ impl ImageWorker {
         let half_pad_w = cell_w; // 1 cell width for each side
         let half_pad_h = cell_h; // 1 cell height for each side
 
-        // Create canvas with transparent background
-        let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 0]));
+        // Parallel decode and resize (CPU-bound operations)
+        let tiles: Vec<_> = paths
+            .par_iter()
+            .take(cols * rows)
+            .enumerate()
+            .filter_map(|(i, path)| {
+                let col = i % cols;
+                let row = i / cols;
 
-        for (i, path) in paths.iter().enumerate() {
-            if i >= cols * rows {
-                break;
-            }
+                // Calculate tile boundaries aligned to cell boundaries
+                let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
+                let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
+                let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
+                let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
 
-            let col = i % cols;
-            let row = i / cols;
+                // Convert to pixels
+                let tile_x = tile_x_cells * cell_w;
+                let tile_y = tile_y_cells * cell_h;
+                let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
+                let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
 
-            // Calculate tile boundaries aligned to cell boundaries
-            // This ensures cursor (drawn in cell units) matches tile positions
-            let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
-            let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
-            let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
-            let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
+                // Calculate inner size for this specific tile (with padding for cursor border)
+                let inner_w = tile_w.saturating_sub(half_pad_w * 2);
+                let inner_h = tile_h.saturating_sub(half_pad_h * 2);
 
-            // Convert to pixels
-            let tile_x = tile_x_cells * cell_w;
-            let tile_y = tile_y_cells * cell_h;
-            let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
-            let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
-
-            // Calculate inner size for this specific tile (with padding for cursor border)
-            let inner_w = tile_w.saturating_sub(half_pad_w * 2);
-            let inner_h = tile_h.saturating_sub(half_pad_h * 2);
-
-            if inner_w == 0 || inner_h == 0 {
-                continue;
-            }
-
-            // Decode and resize image to fit tile (with padding)
-            let img = match Self::decode_image(path) {
-                Some(img) => img,
-                None => {
-                    // Log decode failure if tracing is enabled
-                    if trace_worker {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/svt_worker.log")
-                        {
-                            let _ = writeln!(f, "tile decode failed: {:?}", path);
-                        }
-                    }
-                    continue; // Skip failed images instead of returning None
+                if inner_w == 0 || inner_h == 0 {
+                    return None;
                 }
-            };
-            let (orig_w, orig_h) = (img.width(), img.height());
 
-            // Calculate scaled size to fit within inner area while preserving aspect ratio
-            let scale_w = inner_w as f64 / orig_w as f64;
-            let scale_h = inner_h as f64 / orig_h as f64;
-            let scale = scale_w.min(scale_h).min(1.0); // Don't upscale
+                // Decode and resize image to fit tile (with padding)
+                let img = match Self::decode_image(path) {
+                    Some(img) => img,
+                    None => {
+                        // Log decode failure if tracing is enabled
+                        if trace_worker {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/svt_worker.log")
+                            {
+                                let _ = writeln!(f, "tile decode failed: {:?}", path);
+                            }
+                        }
+                        return None;
+                    }
+                };
+                let (orig_w, orig_h) = (img.width(), img.height());
 
-            let scaled_w = (orig_w as f64 * scale).floor().max(1.0) as u32;
-            let scaled_h = (orig_h as f64 * scale).floor().max(1.0) as u32;
+                // Calculate scaled size to fit within inner area while preserving aspect ratio
+                let scale_w = inner_w as f64 / orig_w as f64;
+                let scale_h = inner_h as f64 / orig_h as f64;
+                let scale = scale_w.min(scale_h).min(1.0); // Don't upscale
 
-            let thumbnail = img.thumbnail(scaled_w, scaled_h);
-            let rgba_thumb = thumbnail.to_rgba8();
+                let scaled_w = (orig_w as f64 * scale).floor().max(1.0) as u32;
+                let scaled_h = (orig_h as f64 * scale).floor().max(1.0) as u32;
 
-            // Calculate position to center image in tile cell (with padding)
-            let img_x = tile_x + half_pad_w + (inner_w.saturating_sub(scaled_w)) / 2;
-            let img_y = tile_y + half_pad_h + (inner_h.saturating_sub(scaled_h)) / 2;
+                let thumbnail = img.resize(scaled_w, scaled_h, filter);
+                let rgba_thumb = thumbnail.to_rgba8();
 
-            // Copy thumbnail to canvas
+                // Calculate position to center image in tile cell (with padding)
+                let img_x = tile_x + half_pad_w + (inner_w.saturating_sub(scaled_w)) / 2;
+                let img_y = tile_y + half_pad_h + (inner_h.saturating_sub(scaled_h)) / 2;
+
+                Some((img_x, img_y, rgba_thumb))
+            })
+            .collect();
+
+        // Sequential copy to canvas (GenericImage is not thread-safe)
+        let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 0]));
+        for (img_x, img_y, rgba_thumb) in tiles {
+            let scaled_w = rgba_thumb.width();
+            let scaled_h = rgba_thumb.height();
             if img_x + scaled_w <= canvas_w && img_y + scaled_h <= canvas_h {
                 let _ = canvas.copy_from(&rgba_thumb, img_x, img_y);
             }

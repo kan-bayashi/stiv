@@ -138,6 +138,8 @@ render_cache_size = 100
 prefetch_count = 5
 compress_level = 6
 cell_aspect_ratio = 2.0
+resize_filter = "triangle"
+tile_filter = "nearest"
 ```
 
 ### 📊 Options
@@ -155,6 +157,8 @@ cell_aspect_ratio = 2.0
 | `debug` | `SVT_DEBUG` | `false` | Debug mode |
 | `trace_worker` | `SVT_TRACE_WORKER` | `false` | Worker tracing |
 | `cell_aspect_ratio` | `SVT_CELL_ASPECT_RATIO` | `2.0` | Cell aspect ratio (tile grid) |
+| `resize_filter` | `SVT_RESIZE_FILTER` | `triangle` | Resize filter for single mode (nearest, triangle, lanczos3) |
+| `tile_filter` | `SVT_TILE_FILTER` | `nearest` | Resize filter for tile mode (fastest for thumbnails) |
 
 ## 🤝 Contributing
 

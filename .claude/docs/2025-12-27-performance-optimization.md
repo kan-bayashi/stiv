@@ -17,44 +17,15 @@ svt の高速化余地を調査した結果をまとめる。
 | SIMD Base64 | `base64_simd` クレート使用 | kgp.rs |
 | 矩形差分計算 | dirty area 管理 | sender.rs |
 | Zlib 圧縮 | KGP 転送データの圧縮 | kgp.rs |
+| DynamicImage Arc 化 | デコード画像の参照カウント共有 | worker.rs |
+| encoded_chunks Arc 化 | エンコード済みデータの参照カウント共有 | worker.rs, app.rs, sender.rs |
+| HashMap キャッシュ | `render_cache` を HashMap + VecDeque (LRU) に変更 | app.rs |
+| Tile 合成の並列化 | rayon で並列デコード・リサイズ | worker.rs |
+| Resize フィルタ設定 | Single: `resize_filter` (default: Triangle), Tile: `tile_filter` (default: Nearest) | worker.rs, config.rs |
 
 ---
 
-## Tier 1: 高インパクト & 低〜中複雑度
-
-### 1. DynamicImage の Arc 化
-
-**現状の問題:**
-```rust
-// worker.rs:125,129,138
-img.clone()  // DynamicImage 全体をメモリにフルコピー
-```
-
-**改善案:**
-```rust
-type ImageCache = Option<(PathBuf, Arc<DynamicImage>)>;
-// clone() が参照カウントのインクリメントのみになる
-```
-
-**効果:** メモリ・CPU 大幅削減
-**複雑度:** 低
-
----
-
-### 2. encoded_chunks の Arc 化
-
-**現状の問題:**
-- app.rs で writer に渡す度に `Vec<Vec<u8>>` をクローン
-
-**改善案:**
-```rust
-pub encoded_chunks: Arc<Vec<Vec<u8>>>,
-```
-
-**効果:** 大画像で効果大
-**複雑度:** 低
-
----
+## 未実装: 中〜高インパクト
 
 ### 3. as_raw().clone() の削減
 
@@ -70,6 +41,7 @@ pub encoded_chunks: Arc<Vec<Vec<u8>>>,
 
 **効果:** メモリ削減
 **複雑度:** 中
+**状態:** 保留（実装複雑で効果限定的）
 
 ---
 
@@ -87,74 +59,11 @@ type ThumbnailCache = LruCache<(PathBuf, u32, u32), Arc<RgbaImage>>;
 
 **効果:** Tile モードの体感改善
 **複雑度:** 中
+**状態:** 未実装
 
 ---
 
-## Tier 2: 中インパクト
-
-### 5. キャッシュ検索の HashMap 化
-
-**現状の問題:**
-```rust
-// app.rs:428,533,649,771,843
-render_cache.iter().find(|r| r.path == path && ...)  // O(n)
-```
-
-**改善案:**
-```rust
-type CacheKey = (PathBuf, (u32, u32), FitMode);
-render_cache: HashMap<CacheKey, RenderedImage>,
-// + LRU 順序管理用の VecDeque
-```
-
-**効果:** O(n) → O(1)
-**複雑度:** 低
-
----
-
-### 6. Tile 合成の並列化
-
-**現状の問題:**
-```rust
-// worker.rs:307-409
-for (i, path) in paths.iter().enumerate() {
-    // 逐次デコード
-}
-```
-
-**改善案:**
-```rust
-use rayon::prelude::*;
-let thumbnails: Vec<_> = paths.par_iter()
-    .map(|path| decode_and_resize(path))
-    .collect();
-```
-
-**効果:** マルチコアで 3-5 倍高速化
-**複雑度:** 中（rayon 依存追加）
-
----
-
-### 7. Tile 高速フィルタ
-
-**現状の問題:**
-- `thumbnail()` はデフォルトで Lanczos3 を使用（高品質だが遅い）
-
-**改善案:**
-```rust
-// config に追加
-tile_filter: FilterType,  // Nearest, Triangle, etc.
-
-// worker.rs
-img.resize(w, h, self.config.tile_filter)
-```
-
-**効果:** CPU 削減（品質とのトレードオフ）
-**複雑度:** 低
-
----
-
-## Tier 3: 小改善
+## 未実装: 小改善
 
 ### 8. terminal::size() 呼び出し統合
 
@@ -202,18 +111,16 @@ base64_simd::STANDARD.encode_to_vec(&data)
 
 ## 推奨実装順序
 
-### Phase 1: 低コスト高リターン
+### 完了 ✓
 1. #1 DynamicImage Arc 化
 2. #2 encoded_chunks Arc 化
 3. #5 HashMap キャッシュ
-
-### Phase 2: UX 改善
-4. #4 Tile サムネイルキャッシュ
+4. #6 Tile 合成の並列化 (rayon)
 5. #7 Tile 高速フィルタ
 
-### Phase 3: 細かい改善
-6. #8, #9, #10 の小改善
+### 次のステップ
+6. #4 Tile サムネイルキャッシュ (中インパクト)
+7. #8, #9, #10 の小改善
 
 ### 保留
 - #3: 実装複雑で効果限定的
-- #6: rayon 依存追加の是非を検討
