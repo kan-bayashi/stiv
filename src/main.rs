@@ -113,19 +113,45 @@ fn main() -> Result<()> {
 /// Duration to show temporary status messages (e.g., "Copied to clipboard").
 const TEMP_STATUS_DURATION: Duration = Duration::from_millis(1500);
 
+/// Mutable state for the event loop.
+struct RunState {
+    /// Earliest time to allow image transmission (for nav latch).
+    nav_until: std::time::Instant,
+    /// Vim-style count prefix (e.g., `5j` = move 5 times).
+    count: u32,
+    /// Last rendered status text (for change detection).
+    last_status: String,
+    /// Last terminal size (for resize detection).
+    last_size: (u16, u16),
+    /// Last status indicator (Busy/Ready).
+    last_indicator: crate::sender::StatusIndicator,
+    /// Deadline for temporary status message display.
+    temp_status_until: Option<std::time::Instant>,
+    /// Whether image transmission was in progress last frame.
+    was_transmitting: bool,
+}
+
+impl RunState {
+    fn new() -> Self {
+        Self {
+            nav_until: std::time::Instant::now() - Duration::from_secs(1),
+            count: 0,
+            last_status: String::new(),
+            last_size: (0, 0),
+            last_indicator: crate::sender::StatusIndicator::Busy,
+            temp_status_until: None,
+            was_transmitting: false,
+        }
+    }
+}
+
 fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
     use std::time::Instant;
 
     let nav_latch = Duration::from_millis(config.nav_latch_ms);
     let cell_aspect_ratio = config.cell_aspect_ratio;
     let mut app = App::new(images, config)?;
-    let mut nav_until = Instant::now() - Duration::from_secs(1);
-    let mut count: u32 = 0;
-    let mut last_status = String::new();
-    let mut last_size: (u16, u16) = (0, 0);
-    let mut last_indicator = crate::sender::StatusIndicator::Busy;
-    let mut temp_status_until: Option<Instant> = None;
-    let mut was_transmitting = false;
+    let mut state = RunState::new();
 
     loop {
         // Get terminal size once per iteration
@@ -141,10 +167,10 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
         let transmitting_after = app.is_transmitting();
 
         // Draw tile cursor after image transmission completes
-        if was_transmitting && !transmitting_after && app.view_mode == ViewMode::Tile {
+        if state.was_transmitting && !transmitting_after && app.view_mode == ViewMode::Tile {
             app.draw_tile_cursor(terminal_rect);
         }
-        was_transmitting = transmitting_before || transmitting_after;
+        state.was_transmitting = transmitting_before || transmitting_after;
 
         // Process all pending events first (drain the queue)
         while event::poll(Duration::ZERO)? {
@@ -156,8 +182,8 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                 clear_screen();
                 // Force full redraw on resize
                 app.handle_resize();
-                last_size = (new_w, new_h);
-                last_status.clear(); // Force status redraw
+                state.last_size = (new_w, new_h);
+                state.last_status.clear(); // Force status redraw
                 continue;
             }
 
@@ -170,8 +196,9 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                     && c.is_ascii_digit()
                 {
                     // Vim-like count prefix: `1..9` start, `0` continues (not a command on its own).
-                    if c != '0' || count != 0 {
-                        count = count
+                    if c != '0' || state.count != 0 {
+                        state.count = state
+                            .count
                             .saturating_mul(10)
                             .saturating_add((c as u8 - b'0') as u32);
                         // Keep reading digits without triggering redraw per digit.
@@ -179,7 +206,7 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                     }
                 }
 
-                let n = count.max(1) as i32;
+                let n = state.count.max(1) as i32;
                 let grid = App::calculate_tile_grid(terminal_rect, cell_aspect_ratio);
 
                 match key.code {
@@ -289,8 +316,8 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                     }
                     KeyCode::Char('g') => {
                         // Vim-like: `g` (or `N g`) goes to first / Nth (1-based) image.
-                        let target = if count > 0 {
-                            (count as usize).saturating_sub(1)
+                        let target = if state.count > 0 {
+                            (state.count as usize).saturating_sub(1)
                         } else {
                             0
                         };
@@ -299,8 +326,8 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                     }
                     KeyCode::Char('G') => {
                         // Vim-like: `G` (or `N G`) goes to last / Nth (1-based) image.
-                        let target = if count > 0 {
-                            (count as usize).saturating_sub(1)
+                        let target = if state.count > 0 {
+                            (state.count as usize).saturating_sub(1)
                         } else {
                             app.images.len().saturating_sub(1)
                         };
@@ -333,7 +360,7 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                                 crate::sender::StatusIndicator::Busy,
                             );
                         }
-                        temp_status_until = Some(Instant::now() + TEMP_STATUS_DURATION);
+                        state.temp_status_until = Some(Instant::now() + TEMP_STATUS_DURATION);
                     }
                     KeyCode::Char('Y') => {
                         if app.copy_image_to_clipboard() {
@@ -349,7 +376,7 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                                 crate::sender::StatusIndicator::Busy,
                             );
                         }
-                        temp_status_until = Some(Instant::now() + TEMP_STATUS_DURATION);
+                        state.temp_status_until = Some(Instant::now() + TEMP_STATUS_DURATION);
                     }
                     _ => {}
                 }
@@ -360,14 +387,14 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                     if !app.is_transmitting() {
                         app.cancel_image_output();
                     }
-                    nav_until = Instant::now() + nav_latch;
-                    count = 0;
+                    state.nav_until = Instant::now() + nav_latch;
+                    state.count = 0;
                     // Don't drain all pending repeats in one loop; update status incrementally.
                     break;
                 }
                 // Count was for a navigation key; reset if another key is pressed.
-                if count != 0 {
-                    count = 0;
+                if state.count != 0 {
+                    state.count = 0;
                 }
             }
         }
@@ -377,26 +404,26 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
             break;
         }
 
-        let allow_transmission = Instant::now() >= nav_until;
+        let allow_transmission = Instant::now() >= state.nav_until;
         let is_navigating = !allow_transmission;
 
         // Clear temporary status after timeout.
-        if temp_status_until.is_some_and(|t| Instant::now() >= t) {
-            temp_status_until = None;
-            last_status.clear(); // Force redraw with normal status.
+        if state.temp_status_until.is_some_and(|t| Instant::now() >= t) {
+            state.temp_status_until = None;
+            state.last_status.clear(); // Force redraw with normal status.
         }
 
         // Update status bar only when it changes (or on resize).
         let status_now = app.status_text(terminal_rect);
         let indicator = app.status_indicator(terminal_rect, allow_transmission);
-        let should_draw = status_now != last_status
-            || (term_w, term_h) != last_size
-            || indicator != last_indicator;
-        if should_draw && temp_status_until.is_none() {
+        let should_draw = status_now != state.last_status
+            || (term_w, term_h) != state.last_size
+            || indicator != state.last_indicator;
+        if should_draw && state.temp_status_until.is_none() {
             app.send_status(status_now.clone(), (term_w, term_h), indicator);
-            last_status = status_now;
-            last_size = (term_w, term_h);
-            last_indicator = indicator;
+            state.last_status = status_now;
+            state.last_size = (term_w, term_h);
+            state.last_indicator = indicator;
         }
 
         // Prepare image render request (non-blocking, sends to sender thread).

@@ -26,8 +26,16 @@ use crate::prefetch::{PrefetchRequest, PrefetchWorker};
 use crate::sender::{StatusIndicator, TerminalWriter, WriterRequest, WriterResultKind};
 use crate::worker::{ImageRequest, ImageWorker};
 
-/// Cache key for rendered images: (path, target_size, fit_mode)
-pub type CacheKey = (PathBuf, (u32, u32), FitMode);
+/// Cache key for rendered images.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct CacheKey {
+    /// Path to the image file.
+    pub path: PathBuf,
+    /// Target size in pixels (width, height).
+    pub target: (u32, u32),
+    /// Fit mode (Normal or Fit).
+    pub fit_mode: FitMode,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PrefetchSignature {
@@ -72,6 +80,9 @@ pub struct App {
     last_prefetch_signature: Option<PrefetchSignature>,
 }
 
+/// Check if running inside tmux.
+///
+/// Returns `true` if the `TMUX` environment variable is set.
 pub fn is_tmux_env() -> bool {
     std::env::var_os("TMUX").is_some()
 }
@@ -367,7 +378,11 @@ impl App {
     pub fn poll_worker(&mut self) {
         // Poll main worker
         while let Some(result) = self.worker.try_recv() {
-            let key: CacheKey = (result.path, result.target, result.fit_mode);
+            let key = CacheKey {
+                path: result.path,
+                target: result.target,
+                fit_mode: result.fit_mode,
+            };
             if self.pending_request.as_ref() == Some(&key) {
                 self.pending_request = None;
             }
@@ -381,7 +396,11 @@ impl App {
 
         // Poll prefetch worker
         while let Some(result) = self.prefetch_worker.try_recv() {
-            let key: CacheKey = (result.path, result.target, result.fit_mode);
+            let key = CacheKey {
+                path: result.path,
+                target: result.target,
+                fit_mode: result.fit_mode,
+            };
             // Skip if already in cache (main worker result takes precedence)
             if !self.render_cache.contains_key(&key) {
                 self.insert_to_cache(
@@ -394,6 +413,7 @@ impl App {
         }
     }
 
+    /// Insert rendered image into cache with LRU eviction.
     fn insert_to_cache(
         &mut self,
         key: CacheKey,
@@ -401,12 +421,11 @@ impl App {
         actual_size: (u32, u32),
         encoded_chunks: Arc<Vec<Vec<u8>>>,
     ) {
-        // Add to cache with LRU management
         if self.render_cache.contains_key(&key) {
-            // Move to end of LRU order
+            // Update existing entry and move to back of LRU order
             self.render_cache_order.retain(|k| k != &key);
         } else if self.render_cache.len() >= self.render_cache_limit {
-            // Evict oldest entry
+            // Evict oldest if at capacity
             if let Some(oldest_key) = self.render_cache_order.pop_front() {
                 self.render_cache.remove(&oldest_key);
             }
@@ -422,12 +441,13 @@ impl App {
         );
     }
 
+    /// Move cache entry to end of LRU order (mark as recently used).
     fn touch_render_cache(&mut self, key: &CacheKey) {
         if matches!(self.render_cache_order.back(), Some(k) if k == key) {
-            return;
+            return; // Already at end
         }
         if !self.render_cache.contains_key(key) {
-            return;
+            return; // Not in cache
         }
         self.render_cache_order.retain(|k| k != key);
         self.render_cache_order.push_back(key.clone());
@@ -494,7 +514,11 @@ impl App {
             }
         };
 
-        let key = (cache_path, target, self.fit_mode);
+        let key = CacheKey {
+            path: cache_path,
+            target,
+            fit_mode: self.fit_mode,
+        };
         let Some(rendered) = self.render_cache.get(&key) else {
             return StatusIndicator::Busy;
         };
@@ -596,7 +620,11 @@ impl App {
         let target = (max_w_px, max_h_px);
 
         // Check if we have a cached rendered result
-        let key = (path.clone(), target, self.fit_mode);
+        let key = CacheKey {
+            path: path.clone(),
+            target,
+            fit_mode: self.fit_mode,
+        };
         if let Some((actual_size, encoded_chunks)) = self
             .render_cache
             .get(&key)
@@ -656,10 +684,14 @@ impl App {
         // Request from worker if not already pending
         let resize_filter = crate::config::parse_filter_type(&self.config.resize_filter);
         let tile_filter = crate::config::parse_filter_type(&self.config.tile_filter);
-        let pending_key = (path, target, self.fit_mode);
+        let pending_key = CacheKey {
+            path,
+            target,
+            fit_mode: self.fit_mode,
+        };
         if self.pending_request.as_ref() != Some(&pending_key) {
             self.worker.request(ImageRequest {
-                path: pending_key.0.clone(),
+                path: pending_key.path.clone(),
                 target,
                 fit_mode: self.fit_mode,
                 kgp_id: self.kgp_id,
@@ -712,7 +744,11 @@ impl App {
 
         // Use a synthetic path for tile cache key (cursor is drawn via ANSI overlay, not part of cache)
         let cache_path = PathBuf::from(format!("__tile_page_{}", page_start));
-        let key = (cache_path.clone(), target, self.fit_mode);
+        let key = CacheKey {
+            path: cache_path.clone(),
+            target,
+            fit_mode: self.fit_mode,
+        };
 
         // Check cache
         if let Some((actual_size, encoded_chunks)) = self
@@ -851,7 +887,11 @@ impl App {
                 continue;
             }
             let path = &self.images[idx];
-            let key = (path.clone(), target, self.fit_mode);
+            let key = CacheKey {
+                path: path.clone(),
+                target,
+                fit_mode: self.fit_mode,
+            };
             if !self.render_cache.contains_key(&key) {
                 paths.push(path.clone());
             }
@@ -931,7 +971,11 @@ impl App {
         for page in page_indices {
             let page_start = page * tiles_per_page;
             let cache_path = PathBuf::from(format!("__tile_page_{}", page_start));
-            let key = (cache_path.clone(), target, self.fit_mode);
+            let key = CacheKey {
+                path: cache_path.clone(),
+                target,
+                fit_mode: self.fit_mode,
+            };
 
             if self.render_cache.contains_key(&key) {
                 continue;
@@ -1036,7 +1080,7 @@ impl App {
         // Search by path in cache keys
         self.render_cache
             .iter()
-            .find(|(k, _)| &k.0 == path)
+            .find(|(k, _)| &k.path == path)
             .map(|(_, v)| v.original_size)
     }
 
@@ -1217,7 +1261,11 @@ mod tests {
     #[test]
     fn test_reload_clears_cache() {
         let mut app = create_test_app(2);
-        let key: CacheKey = (PathBuf::from("x.png"), (1, 1), FitMode::Normal);
+        let key = CacheKey {
+            path: PathBuf::from("x.png"),
+            target: (1, 1),
+            fit_mode: FitMode::Normal,
+        };
         app.render_cache.insert(
             key.clone(),
             RenderedImage {
@@ -1227,7 +1275,11 @@ mod tests {
             },
         );
         app.render_cache_order.push_back(key);
-        app.pending_request = Some((PathBuf::from("y.png"), (1, 1), FitMode::Normal));
+        app.pending_request = Some(CacheKey {
+            path: PathBuf::from("y.png"),
+            target: (1, 1),
+            fit_mode: FitMode::Normal,
+        });
         app.in_flight_transmit = true;
 
         app.reload();

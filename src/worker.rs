@@ -24,8 +24,18 @@ use crate::kgp::encode_chunks;
 /// Default capacity for the tile thumbnail LRU cache.
 const THUMBNAIL_CACHE_SIZE: usize = 500;
 
-/// Cache key for tile thumbnails: (path, width, height, filter)
-type ThumbnailKey = (PathBuf, u32, u32, u8);
+/// Cache key for tile thumbnails.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ThumbnailKey {
+    /// Path to the image file.
+    path: PathBuf,
+    /// Thumbnail width in pixels.
+    width: u32,
+    /// Thumbnail height in pixels.
+    height: u32,
+    /// Resize filter type ID.
+    filter_id: u8,
+}
 
 fn filter_cache_id(filter: image::imageops::FilterType) -> u8 {
     match filter {
@@ -65,6 +75,7 @@ impl ThumbnailCache {
 
     fn insert(&mut self, key: ThumbnailKey, img: Arc<RgbaImage>) {
         if self.cache.contains_key(&key) {
+            // Update existing entry and move to back of LRU order
             if !matches!(self.order.back(), Some(k) if k == &key) {
                 self.order.retain(|k| k != &key);
                 self.order.push_back(key.clone());
@@ -72,33 +83,46 @@ impl ThumbnailCache {
             self.cache.insert(key, img);
             return;
         }
-        if self.cache.len() >= self.capacity {
-            // Evict oldest
-            if let Some(oldest) = self.order.pop_front() {
-                self.cache.remove(&oldest);
-            }
+        // Evict oldest if at capacity
+        if self.cache.len() >= self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.cache.remove(&oldest);
         }
         self.order.push_back(key.clone());
         self.cache.insert(key, img);
     }
 }
 
+/// Request to render an image.
 pub struct ImageRequest {
+    /// Path to the image file.
     pub path: PathBuf,
+    /// Target size in pixels (width, height).
     pub target: (u32, u32),
+    /// Fit mode (Normal or Fit).
     pub fit_mode: FitMode,
+    /// Unique ID for Kitty Graphics Protocol.
     pub kgp_id: u32,
+    /// Whether running inside tmux.
     pub is_tmux: bool,
+    /// Zlib compression level (None = disabled).
     pub compress_level: Option<u32>,
+    /// Max pixels for tmux+kitty compatibility.
     pub tmux_kitty_max_pixels: u64,
+    /// Enable trace logging to /tmp/svt_worker.log.
     pub trace_worker: bool,
-    // Resize filter for Single mode
+    /// Resize filter for Single mode.
     pub resize_filter: image::imageops::FilterType,
-    // Tile mode fields
+    /// View mode (Single or Tile).
     pub view_mode: ViewMode,
+    /// Paths for tile mode (None in Single mode).
     pub tile_paths: Option<Vec<PathBuf>>,
+    /// Grid dimensions for tile mode (cols, rows).
     pub tile_grid: Option<(usize, usize)>,
-    pub cell_size: Option<(u16, u16)>, // (width, height) in pixels for padding calculation
+    /// Cell size in pixels (width, height) for padding.
+    pub cell_size: Option<(u16, u16)>,
+    /// Resize filter for Tile mode.
     pub tile_filter: image::imageops::FilterType,
 }
 
@@ -462,7 +486,12 @@ impl ImageWorker {
                 continue;
             }
 
-            let cache_key = (path.clone(), inner_w, inner_h, filter_id);
+            let cache_key = ThumbnailKey {
+                path: path.clone(),
+                width: inner_w,
+                height: inner_h,
+                filter_id,
+            };
             if let Some(cached_thumb) = thumbnail_cache.get(&cache_key) {
                 // Cache hit: calculate position and add to cached_tiles
                 let scaled_w = cached_thumb.width();
@@ -534,7 +563,12 @@ impl ImageWorker {
 
         // Add new thumbnails to cache
         for (path, inner_w, inner_h, img_x, img_y, rgba_thumb) in new_tiles {
-            let cache_key = (path, inner_w, inner_h, filter_id);
+            let cache_key = ThumbnailKey {
+                path,
+                width: inner_w,
+                height: inner_h,
+                filter_id,
+            };
             thumbnail_cache.insert(cache_key, Arc::clone(&rgba_thumb));
             cached_tiles.push((img_x, img_y, rgba_thumb));
         }
@@ -625,11 +659,20 @@ mod tests {
         Arc::new(RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255])))
     }
 
+    fn create_thumbnail_key(path: &str, w: u32, h: u32) -> ThumbnailKey {
+        ThumbnailKey {
+            path: PathBuf::from(path),
+            width: w,
+            height: h,
+            filter_id: 0,
+        }
+    }
+
     #[test]
     fn test_thumbnail_cache_basic_operations() {
         let mut cache = ThumbnailCache::new(3);
-        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
-        let key2 = (PathBuf::from("b.png"), 100, 100, 0);
+        let key1 = create_thumbnail_key("a.png", 100, 100);
+        let key2 = create_thumbnail_key("b.png", 100, 100);
 
         let img1 = create_test_image(100, 100);
         let img2 = create_test_image(100, 100);
@@ -647,9 +690,9 @@ mod tests {
     #[test]
     fn test_thumbnail_cache_lru_eviction() {
         let mut cache = ThumbnailCache::new(2);
-        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
-        let key2 = (PathBuf::from("b.png"), 100, 100, 0);
-        let key3 = (PathBuf::from("c.png"), 100, 100, 0);
+        let key1 = create_thumbnail_key("a.png", 100, 100);
+        let key2 = create_thumbnail_key("b.png", 100, 100);
+        let key3 = create_thumbnail_key("c.png", 100, 100);
 
         let img = create_test_image(100, 100);
 
@@ -667,9 +710,9 @@ mod tests {
     #[test]
     fn test_thumbnail_cache_lru_access_order() {
         let mut cache = ThumbnailCache::new(2);
-        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
-        let key2 = (PathBuf::from("b.png"), 100, 100, 0);
-        let key3 = (PathBuf::from("c.png"), 100, 100, 0);
+        let key1 = create_thumbnail_key("a.png", 100, 100);
+        let key2 = create_thumbnail_key("b.png", 100, 100);
+        let key3 = create_thumbnail_key("c.png", 100, 100);
 
         let img = create_test_image(100, 100);
 
@@ -690,7 +733,7 @@ mod tests {
     #[test]
     fn test_thumbnail_cache_update_existing() {
         let mut cache = ThumbnailCache::new(2);
-        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
+        let key1 = create_thumbnail_key("a.png", 100, 100);
 
         let img1 = create_test_image(100, 100);
         let img2 = create_test_image(50, 50);
