@@ -326,8 +326,10 @@ impl ImageWorker {
         let canvas_h_cells = canvas_h / cell_h;
 
         // Padding around each thumbnail (leaves space for cursor border).
-        // Cursor is 1 cell wide, so padding needs to be at least 1 cell in pixels.
-        let tile_padding = cell_w.max(cell_h);
+        // Cursor is 1 cell wide, so padding needs to be at least 1 cell in each direction.
+        // Use separate padding for horizontal and vertical to handle non-square cells.
+        let half_pad_w = cell_w;  // 1 cell width for each side
+        let half_pad_h = cell_h;  // 1 cell height for each side
 
         // Create canvas with transparent background
         let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 0]));
@@ -353,12 +355,9 @@ impl ImageWorker {
             let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
             let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
 
-            // Half padding on all sides (adjacent tiles share the border)
-            let half_pad = tile_padding / 2;
-
-            // Calculate inner size for this specific tile
-            let inner_w = tile_w.saturating_sub(half_pad * 2);
-            let inner_h = tile_h.saturating_sub(half_pad * 2);
+            // Calculate inner size for this specific tile (with padding for cursor border)
+            let inner_w = tile_w.saturating_sub(half_pad_w * 2);
+            let inner_h = tile_h.saturating_sub(half_pad_h * 2);
 
             if inner_w == 0 || inner_h == 0 {
                 continue;
@@ -396,8 +395,8 @@ impl ImageWorker {
             let rgba_thumb = thumbnail.to_rgba8();
 
             // Calculate position to center image in tile cell (with padding)
-            let img_x = tile_x + half_pad + (inner_w.saturating_sub(scaled_w)) / 2;
-            let img_y = tile_y + half_pad + (inner_h.saturating_sub(scaled_h)) / 2;
+            let img_x = tile_x + half_pad_w + (inner_w.saturating_sub(scaled_w)) / 2;
+            let img_y = tile_y + half_pad_h + (inner_h.saturating_sub(scaled_h)) / 2;
 
             // Copy thumbnail to canvas
             if img_x + scaled_w <= canvas_w && img_y + scaled_h <= canvas_h {
