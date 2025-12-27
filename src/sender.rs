@@ -447,6 +447,8 @@ impl TerminalWriter {
         cell_size: (u16, u16),
         draw: bool,
     ) -> Vec<u8> {
+        use std::fmt::Write;
+
         let (cols, rows) = grid;
         if cols == 0 || rows == 0 || cursor_idx >= cols * rows {
             return Vec::new();
@@ -484,14 +486,14 @@ impl TerminalWriter {
         const HORIZONTAL: char = '─';
         const VERTICAL: char = '│';
 
-        let mut buf = Vec::new();
+        // Pre-allocate buffer (estimate: ~20 bytes per cell)
+        let estimated_size = ((tile_x_end - tile_x) + (tile_y_end - tile_y)) as usize * 20;
+        let mut s = String::with_capacity(estimated_size);
 
         if draw {
-            // Cyan color (foreground 36)
-            buf.extend_from_slice(b"\x1b[36m");
+            s.push_str("\x1b[36m"); // Cyan color
         } else {
-            // Reset color (draw spaces to clear)
-            buf.extend_from_slice(b"\x1b[0m");
+            s.push_str("\x1b[0m"); // Reset color
         }
 
         let char_h = if draw { HORIZONTAL } else { ' ' };
@@ -504,35 +506,32 @@ impl TerminalWriter {
         // Top edge: move to position, draw corner + horizontal line + corner
         let top_row = tile_y + 1; // 1-based
         let left_col = tile_x + 1; // 1-based
-        let right_col = tile_x_end; // 1-based (last column of tile, calculated from next tile's start)
+        let right_col = tile_x_end; // 1-based
 
-        // Draw top-left corner
-        buf.extend_from_slice(format!("\x1b[{};{}H{}", top_row, left_col, char_tl).as_bytes());
-        // Draw top horizontal line
+        // Draw top edge
+        let _ = write!(s, "\x1b[{};{}H{}", top_row, left_col, char_tl);
         for c in (left_col + 1)..right_col {
-            buf.extend_from_slice(format!("\x1b[{};{}H{}", top_row, c, char_h).as_bytes());
+            let _ = write!(s, "\x1b[{};{}H{}", top_row, c, char_h);
         }
-        // Draw top-right corner
-        buf.extend_from_slice(format!("\x1b[{};{}H{}", top_row, right_col, char_tr).as_bytes());
+        let _ = write!(s, "\x1b[{};{}H{}", top_row, right_col, char_tr);
 
         // Bottom edge
-        let bottom_row = tile_y_end; // 1-based (last row of tile, calculated from next tile's start)
-        buf.extend_from_slice(format!("\x1b[{};{}H{}", bottom_row, left_col, char_bl).as_bytes());
+        let bottom_row = tile_y_end;
+        let _ = write!(s, "\x1b[{};{}H{}", bottom_row, left_col, char_bl);
         for c in (left_col + 1)..right_col {
-            buf.extend_from_slice(format!("\x1b[{};{}H{}", bottom_row, c, char_h).as_bytes());
+            let _ = write!(s, "\x1b[{};{}H{}", bottom_row, c, char_h);
         }
-        buf.extend_from_slice(format!("\x1b[{};{}H{}", bottom_row, right_col, char_br).as_bytes());
+        let _ = write!(s, "\x1b[{};{}H{}", bottom_row, right_col, char_br);
 
         // Left and right edges (vertical lines)
         for r in (top_row + 1)..bottom_row {
-            buf.extend_from_slice(format!("\x1b[{};{}H{}", r, left_col, char_v).as_bytes());
-            buf.extend_from_slice(format!("\x1b[{};{}H{}", r, right_col, char_v).as_bytes());
+            let _ = write!(s, "\x1b[{};{}H{}", r, left_col, char_v);
+            let _ = write!(s, "\x1b[{};{}H{}", r, right_col, char_v);
         }
 
-        // Reset attributes
-        buf.extend_from_slice(b"\x1b[0m");
+        s.push_str("\x1b[0m"); // Reset attributes
 
-        buf
+        s.into_bytes()
     }
 }
 

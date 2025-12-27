@@ -237,9 +237,13 @@ impl ImageWorker {
         };
 
         // Composite tile images (cursor is drawn separately via ANSI)
-        let Some((composite, actual_size)) =
-            Self::composite_tile_images(tile_paths, grid, req.target, req.cell_size)
-        else {
+        let Some((composite, actual_size)) = Self::composite_tile_images(
+            tile_paths,
+            grid,
+            req.target,
+            req.cell_size,
+            req.trace_worker,
+        ) else {
             return;
         };
 
@@ -295,7 +299,7 @@ impl ImageWorker {
         }
     }
 
-    fn decode_image(path: &PathBuf) -> Option<DynamicImage> {
+    fn decode_image(path: &std::path::Path) -> Option<DynamicImage> {
         image::ImageReader::open(path).ok()?.decode().ok()
     }
 
@@ -305,6 +309,7 @@ impl ImageWorker {
         grid: (usize, usize),
         canvas_size: (u32, u32),
         cell_size: Option<(u16, u16)>,
+        trace_worker: bool,
     ) -> Option<(DynamicImage, (u32, u32))> {
         use image::{GenericImage, Rgba, RgbaImage};
 
@@ -362,7 +367,20 @@ impl ImageWorker {
             // Decode and resize image to fit tile (with padding)
             let img = match Self::decode_image(path) {
                 Some(img) => img,
-                None => continue, // Skip failed images instead of returning None
+                None => {
+                    // Log decode failure if tracing is enabled
+                    if trace_worker {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/svt_worker.log")
+                        {
+                            let _ = writeln!(f, "tile decode failed: {:?}", path);
+                        }
+                    }
+                    continue; // Skip failed images instead of returning None
+                }
             };
             let (orig_w, orig_h) = (img.width(), img.height());
 

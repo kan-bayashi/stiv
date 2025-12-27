@@ -85,7 +85,7 @@ impl App {
             current_index: 0,
             picker,
             should_quit: false,
-            fit_mode: FitMode::Normal,
+            fit_mode: FitMode::default(),
             view_mode: ViewMode::default(),
             tile_cursor: 0,
             prev_tile_cursor: None,
@@ -205,7 +205,7 @@ impl App {
     /// Returns true if page changed.
     pub fn move_tile_cursor_row(&mut self, delta: i32, grid: (usize, usize)) -> bool {
         let (cols, _) = grid;
-        self.move_tile_cursor(delta * cols as i32, grid)
+        self.move_tile_cursor(delta.saturating_mul(cols as i32), grid)
     }
 
     /// Move tile page (Shift+H/J/K/L).
@@ -254,7 +254,10 @@ impl App {
 
     /// Select current tile and switch to Single mode.
     pub fn select_tile(&mut self) {
-        self.current_index = self.tile_cursor;
+        if self.images.is_empty() {
+            return;
+        }
+        self.current_index = self.tile_cursor.min(self.images.len().saturating_sub(1));
         self.view_mode = ViewMode::Single;
         self.invalidate_render();
     }
@@ -267,28 +270,16 @@ impl App {
         self.kgp_state = KgpState::default();
     }
 
-    fn go_to_index(&mut self, index: usize) {
+    /// Navigate to index, updating both current_index and tile_cursor.
+    pub fn go_to_index_with_tile(&mut self, index: usize) {
         if self.images.is_empty() {
             return;
         }
         let index = index.min(self.images.len().saturating_sub(1));
-        if self.current_index == index {
-            return;
-        }
         self.current_index = index;
+        self.tile_cursor = index;
+        self.prev_tile_cursor = None;
         self.invalidate_render();
-    }
-
-    pub fn go_first(&mut self) {
-        self.go_to_index(0);
-    }
-
-    pub fn go_last(&mut self) {
-        self.go_to_index(self.images.len().saturating_sub(1));
-    }
-
-    pub fn go_to_1based(&mut self, n: usize) {
-        self.go_to_index(n.saturating_sub(1));
     }
 
     fn invalidate_render(&mut self) {
@@ -315,12 +306,13 @@ impl App {
         // For visually square tiles, we need to account for the cell aspect ratio.
         // cell_aspect_ratio = cell_height_pixels / cell_width_pixels (typically ~2.0)
         const MIN_TILE_WIDTH: u16 = 16;
+        const MIN_TILE_HEIGHT: u16 = 4;
         const MAX_COLS: usize = 6;
         const MAX_ROWS: usize = 6;
 
         // Calculate min tile height to get visually square tiles
         let min_tile_height = (MIN_TILE_WIDTH as f64 / cell_aspect_ratio).round() as u16;
-        let min_tile_height = min_tile_height.max(4); // Minimum 4 cells tall
+        let min_tile_height = min_tile_height.max(MIN_TILE_HEIGHT);
 
         let cols = (image_area.width / MIN_TILE_WIDTH) as usize;
         let rows = (image_area.height / min_tile_height) as usize;
@@ -922,7 +914,7 @@ mod tests {
             current_index: 0,
             picker: Picker::from_fontsize((8, 16)),
             should_quit: false,
-            fit_mode: FitMode::Normal,
+            fit_mode: FitMode::default(),
             view_mode: ViewMode::default(),
             tile_cursor: 0,
             prev_tile_cursor: None,
@@ -985,22 +977,26 @@ mod tests {
     }
 
     #[test]
-    fn test_go_first_and_last() {
+    fn test_go_to_index_with_tile() {
         let mut app = create_test_app(3);
         app.current_index = 1;
-        app.go_first();
+        app.go_to_index_with_tile(0);
         assert_eq!(app.current_index, 0);
-        app.go_last();
+        assert_eq!(app.tile_cursor, 0);
+        app.go_to_index_with_tile(2);
         assert_eq!(app.current_index, 2);
+        assert_eq!(app.tile_cursor, 2);
     }
 
     #[test]
-    fn test_go_to_1based_clamps() {
+    fn test_go_to_index_with_tile_clamps() {
         let mut app = create_test_app(3);
-        app.go_to_1based(2);
+        app.go_to_index_with_tile(1);
         assert_eq!(app.current_index, 1);
-        app.go_to_1based(999);
+        assert_eq!(app.tile_cursor, 1);
+        app.go_to_index_with_tile(999);
         assert_eq!(app.current_index, 2);
+        assert_eq!(app.tile_cursor, 2);
     }
 
     #[test]

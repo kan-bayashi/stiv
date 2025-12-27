@@ -26,7 +26,7 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use ratatui::crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind},
     terminal,
 };
 use ratatui::layout::Rect;
@@ -84,7 +84,7 @@ fn collect_images(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         out.extend(collect_images_from_path(p)?);
     }
     // De-dupe while preserving order (e.g. overlapping directories/globs).
-    let mut seen = std::collections::HashSet::<PathBuf>::new();
+    let mut seen = std::collections::HashSet::<PathBuf>::with_capacity(out.len());
     out.retain(|p| seen.insert(p.clone()));
     if out.is_empty() {
         anyhow::bail!("No image files found");
@@ -167,7 +167,6 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                 let (tw, th) = terminal::size().unwrap_or((80, 24));
                 let terminal_rect = Rect::new(0, 0, tw, th);
                 let grid = App::calculate_tile_grid(terminal_rect, cell_aspect_ratio);
-                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
                 match key.code {
                     KeyCode::Char('q') => app.should_quit = true,
@@ -177,16 +176,11 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                             did_nav = true;
                         }
                         ViewMode::Tile => {
-                            if shift {
-                                app.move_tile_page(n, grid);
+                            let page_changed = app.move_tile_cursor_row(n, grid);
+                            if page_changed {
                                 did_nav = true;
                             } else {
-                                let page_changed = app.move_tile_cursor_row(n, grid);
-                                if page_changed {
-                                    did_nav = true;
-                                } else {
-                                    app.draw_tile_cursor(terminal_rect);
-                                }
+                                app.draw_tile_cursor(terminal_rect);
                             }
                         }
                     },
@@ -196,16 +190,11 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                             did_nav = true;
                         }
                         ViewMode::Tile => {
-                            if shift {
-                                app.move_tile_page(-n, grid);
+                            let page_changed = app.move_tile_cursor_row(-n, grid);
+                            if page_changed {
                                 did_nav = true;
                             } else {
-                                let page_changed = app.move_tile_cursor_row(-n, grid);
-                                if page_changed {
-                                    did_nav = true;
-                                } else {
-                                    app.draw_tile_cursor(terminal_rect);
-                                }
+                                app.draw_tile_cursor(terminal_rect);
                             }
                         }
                     },
@@ -215,16 +204,11 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                             did_nav = true;
                         }
                         ViewMode::Tile => {
-                            if shift {
-                                app.move_tile_page(-n, grid);
+                            let page_changed = app.move_tile_cursor(-n, grid);
+                            if page_changed {
                                 did_nav = true;
                             } else {
-                                let page_changed = app.move_tile_cursor(-n, grid);
-                                if page_changed {
-                                    did_nav = true;
-                                } else {
-                                    app.draw_tile_cursor(terminal_rect);
-                                }
+                                app.draw_tile_cursor(terminal_rect);
                             }
                         }
                     },
@@ -234,16 +218,11 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                             did_nav = true;
                         }
                         ViewMode::Tile => {
-                            if shift {
-                                app.move_tile_page(n, grid);
+                            let page_changed = app.move_tile_cursor(n, grid);
+                            if page_changed {
                                 did_nav = true;
                             } else {
-                                let page_changed = app.move_tile_cursor(n, grid);
-                                if page_changed {
-                                    did_nav = true;
-                                } else {
-                                    app.draw_tile_cursor(terminal_rect);
-                                }
+                                app.draw_tile_cursor(terminal_rect);
                             }
                         }
                     },
@@ -296,20 +275,22 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                     }
                     KeyCode::Char('g') => {
                         // Vim-like: `g` (or `N g`) goes to first / Nth (1-based) image.
-                        if count > 0 {
-                            app.go_to_1based(count as usize);
+                        let target = if count > 0 {
+                            (count as usize).saturating_sub(1)
                         } else {
-                            app.go_first();
-                        }
+                            0
+                        };
+                        app.go_to_index_with_tile(target);
                         did_nav = true;
                     }
                     KeyCode::Char('G') => {
                         // Vim-like: `G` (or `N G`) goes to last / Nth (1-based) image.
-                        if count > 0 {
-                            app.go_to_1based(count as usize);
+                        let target = if count > 0 {
+                            (count as usize).saturating_sub(1)
                         } else {
-                            app.go_last();
-                        }
+                            app.images.len().saturating_sub(1)
+                        };
+                        app.go_to_index_with_tile(target);
                         did_nav = true;
                     }
                     KeyCode::Char('f') => {
