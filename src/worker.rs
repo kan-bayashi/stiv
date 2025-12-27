@@ -21,6 +21,9 @@ use image::{DynamicImage, RgbaImage};
 use crate::fit::{FitMode, ViewMode};
 use crate::kgp::encode_chunks;
 
+/// Default capacity for the tile thumbnail LRU cache.
+const THUMBNAIL_CACHE_SIZE: usize = 500;
+
 /// Cache key for tile thumbnails: (path, width, height, filter)
 type ThumbnailKey = (PathBuf, u32, u32, u8);
 
@@ -146,7 +149,7 @@ impl ImageWorker {
         tile_threads: usize,
     ) {
         let mut cache: Option<(PathBuf, Arc<DynamicImage>)> = None;
-        let mut thumbnail_cache = ThumbnailCache::new(500); // Cache up to 500 thumbnails
+        let mut thumbnail_cache = ThumbnailCache::new(THUMBNAIL_CACHE_SIZE);
         let mut pending: Option<ImageRequest> = None;
 
         // Create dedicated thread pool for tile processing
@@ -611,5 +614,133 @@ impl ImageWorker {
             actual_size,
             encoded_chunks: Arc::new(encoded_chunks),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_image(w: u32, h: u32) -> Arc<RgbaImage> {
+        Arc::new(RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255])))
+    }
+
+    #[test]
+    fn test_thumbnail_cache_basic_operations() {
+        let mut cache = ThumbnailCache::new(3);
+        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
+        let key2 = (PathBuf::from("b.png"), 100, 100, 0);
+
+        let img1 = create_test_image(100, 100);
+        let img2 = create_test_image(100, 100);
+
+        // Insert and retrieve
+        cache.insert(key1.clone(), Arc::clone(&img1));
+        assert!(cache.get(&key1).is_some());
+        assert!(cache.get(&key2).is_none());
+
+        cache.insert(key2.clone(), Arc::clone(&img2));
+        assert!(cache.get(&key1).is_some());
+        assert!(cache.get(&key2).is_some());
+    }
+
+    #[test]
+    fn test_thumbnail_cache_lru_eviction() {
+        let mut cache = ThumbnailCache::new(2);
+        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
+        let key2 = (PathBuf::from("b.png"), 100, 100, 0);
+        let key3 = (PathBuf::from("c.png"), 100, 100, 0);
+
+        let img = create_test_image(100, 100);
+
+        cache.insert(key1.clone(), Arc::clone(&img));
+        cache.insert(key2.clone(), Arc::clone(&img));
+
+        // Cache is full (capacity=2), inserting key3 should evict key1 (oldest)
+        cache.insert(key3.clone(), Arc::clone(&img));
+
+        assert!(cache.get(&key1).is_none()); // Evicted
+        assert!(cache.get(&key2).is_some());
+        assert!(cache.get(&key3).is_some());
+    }
+
+    #[test]
+    fn test_thumbnail_cache_lru_access_order() {
+        let mut cache = ThumbnailCache::new(2);
+        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
+        let key2 = (PathBuf::from("b.png"), 100, 100, 0);
+        let key3 = (PathBuf::from("c.png"), 100, 100, 0);
+
+        let img = create_test_image(100, 100);
+
+        cache.insert(key1.clone(), Arc::clone(&img));
+        cache.insert(key2.clone(), Arc::clone(&img));
+
+        // Access key1 to move it to the back (most recently used)
+        let _ = cache.get(&key1);
+
+        // Insert key3 should evict key2 (now oldest)
+        cache.insert(key3.clone(), Arc::clone(&img));
+
+        assert!(cache.get(&key1).is_some()); // Still present (was accessed)
+        assert!(cache.get(&key2).is_none()); // Evicted
+        assert!(cache.get(&key3).is_some());
+    }
+
+    #[test]
+    fn test_thumbnail_cache_update_existing() {
+        let mut cache = ThumbnailCache::new(2);
+        let key1 = (PathBuf::from("a.png"), 100, 100, 0);
+
+        let img1 = create_test_image(100, 100);
+        let img2 = create_test_image(50, 50);
+
+        cache.insert(key1.clone(), Arc::clone(&img1));
+        cache.insert(key1.clone(), Arc::clone(&img2));
+
+        // Should still have only one entry
+        assert_eq!(cache.cache.len(), 1);
+
+        // Should return the updated image
+        let retrieved = cache.get(&key1).unwrap();
+        assert_eq!(retrieved.width(), 50);
+    }
+
+    #[test]
+    fn test_filter_cache_id() {
+        assert_eq!(filter_cache_id(image::imageops::FilterType::Nearest), 0);
+        assert_eq!(filter_cache_id(image::imageops::FilterType::Triangle), 1);
+        assert_eq!(filter_cache_id(image::imageops::FilterType::CatmullRom), 2);
+        assert_eq!(filter_cache_id(image::imageops::FilterType::Gaussian), 3);
+        assert_eq!(filter_cache_id(image::imageops::FilterType::Lanczos3), 4);
+    }
+
+    #[test]
+    fn test_compute_target_normal_shrink() {
+        // Large image should be shrunk to fit
+        let result = ImageWorker::compute_target((2000, 1000), (800, 600), FitMode::Normal);
+        assert!(result.0 <= 800);
+        assert!(result.1 <= 600);
+        // Aspect ratio preserved
+        let orig_ratio = 2000.0 / 1000.0;
+        let result_ratio = result.0 as f64 / result.1 as f64;
+        assert!((orig_ratio - result_ratio).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_target_normal_no_enlarge() {
+        // Small image should not be enlarged in Normal mode
+        let result = ImageWorker::compute_target((100, 50), (800, 600), FitMode::Normal);
+        assert_eq!(result, (100, 50));
+    }
+
+    #[test]
+    fn test_compute_target_fit_enlarge() {
+        // Small image should be enlarged in Fit mode
+        let result = ImageWorker::compute_target((100, 50), (800, 600), FitMode::Fit);
+        assert!(result.0 > 100);
+        assert!(result.1 > 50);
+        assert!(result.0 <= 800);
+        assert!(result.1 <= 600);
     }
 }
