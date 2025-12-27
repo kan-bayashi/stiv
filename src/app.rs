@@ -270,6 +270,16 @@ impl App {
         self.kgp_state = KgpState::default();
     }
 
+    /// Handle terminal resize: clear display and force re-render.
+    pub fn handle_resize(&mut self) {
+        // Clear existing KGP image from terminal
+        self.clear_kgp_overlay();
+        // Clear render cache (images need re-rendering at new size)
+        self.render_cache.clear();
+        self.pending_request = None;
+        self.kgp_state = KgpState::default();
+    }
+
     /// Navigate to index, updating both current_index and tile_cursor.
     pub fn go_to_index_with_tile(&mut self, index: usize) {
         if self.images.is_empty() {

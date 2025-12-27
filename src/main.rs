@@ -143,9 +143,22 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
         }
         was_transmitting = transmitting_before || transmitting_after;
 
-        // Process all pending key events first (drain the queue)
+        // Process all pending events first (drain the queue)
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()?
+            let ev = event::read()?;
+
+            // Handle resize events
+            if let Event::Resize(new_w, new_h) = ev {
+                // Clear entire screen (including old status bar position)
+                clear_screen();
+                // Force full redraw on resize
+                app.handle_resize();
+                last_size = (new_w, new_h);
+                last_status.clear(); // Force status redraw
+                continue;
+            }
+
+            if let Event::Key(key) = ev
                 && key.kind == KeyEventKind::Press
             {
                 let mut did_nav = false;
@@ -448,6 +461,18 @@ fn restore_terminal(use_alt_screen: bool) {
         let _ = execute!(stdout(), LeaveAlternateScreen);
     }
     let _ = execute!(stdout(), Show);
+}
+
+fn clear_screen() {
+    use std::io::stdout;
+
+    use ratatui::crossterm::{
+        cursor::MoveTo,
+        execute,
+        terminal::{Clear, ClearType},
+    };
+
+    let _ = execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0));
 }
 
 #[cfg(test)]
