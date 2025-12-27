@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use image::DynamicImage;
@@ -41,7 +42,7 @@ pub struct ImageResult {
     pub fit_mode: FitMode,
     pub original_size: (u32, u32),
     pub actual_size: (u32, u32),
-    pub encoded_chunks: Vec<Vec<u8>>,
+    pub encoded_chunks: Arc<Vec<Vec<u8>>>,
 }
 
 pub struct ImageWorker {
@@ -77,7 +78,7 @@ impl ImageWorker {
     }
 
     fn worker_loop(request_rx: Receiver<ImageRequest>, result_tx: Sender<ImageResult>) {
-        let mut cache: Option<(PathBuf, DynamicImage)> = None;
+        let mut cache: Option<(PathBuf, Arc<DynamicImage>)> = None;
         let mut pending: Option<ImageRequest> = None;
 
         loop {
@@ -113,21 +114,22 @@ impl ImageWorker {
 
     fn process_single_request(
         req: &ImageRequest,
-        cache: &mut Option<(PathBuf, DynamicImage)>,
+        cache: &mut Option<(PathBuf, Arc<DynamicImage>)>,
         pending: &mut Option<ImageRequest>,
         request_rx: &Receiver<ImageRequest>,
         result_tx: &Sender<ImageResult>,
     ) {
-        // Decode (with cache)
+        // Decode (with cache) - Arc clone is cheap (reference count only)
         let decode_start = std::time::Instant::now();
-        let decoded = if let Some((cached_path, img)) = cache.as_ref() {
+        let decoded: Arc<DynamicImage> = if let Some((cached_path, img)) = cache.as_ref() {
             if cached_path == &req.path {
-                img.clone()
+                Arc::clone(img)
             } else {
                 match Self::decode_image(&req.path) {
                     Some(img) => {
-                        *cache = Some((req.path.clone(), img.clone()));
-                        img
+                        let arc_img = Arc::new(img);
+                        *cache = Some((req.path.clone(), Arc::clone(&arc_img)));
+                        arc_img
                     }
                     None => return,
                 }
@@ -135,8 +137,9 @@ impl ImageWorker {
         } else {
             match Self::decode_image(&req.path) {
                 Some(img) => {
-                    *cache = Some((req.path.clone(), img.clone()));
-                    img
+                    let arc_img = Arc::new(img);
+                    *cache = Some((req.path.clone(), Arc::clone(&arc_img)));
+                    arc_img
                 }
                 None => return,
             }
@@ -166,12 +169,13 @@ impl ImageWorker {
             }
         }
 
-        // Resize
+        // Resize - use Cow to avoid clone when no resize needed
+        use std::borrow::Cow;
         let resize_start = std::time::Instant::now();
-        let resized = if target_w != orig_w || target_h != orig_h {
-            decoded.thumbnail(target_w, target_h)
+        let resized: Cow<'_, DynamicImage> = if target_w != orig_w || target_h != orig_h {
+            Cow::Owned(decoded.thumbnail(target_w, target_h))
         } else {
-            decoded
+            Cow::Borrowed(&*decoded)
         };
         let actual_size = (resized.width(), resized.height());
         let resize_elapsed = resize_start.elapsed();
@@ -219,7 +223,7 @@ impl ImageWorker {
             fit_mode: req.fit_mode,
             original_size: (orig_w, orig_h),
             actual_size,
-            encoded_chunks,
+            encoded_chunks: Arc::new(encoded_chunks),
         });
     }
 
@@ -263,7 +267,7 @@ impl ImageWorker {
             fit_mode: req.fit_mode,
             original_size: actual_size,
             actual_size,
-            encoded_chunks,
+            encoded_chunks: Arc::new(encoded_chunks),
         });
     }
 

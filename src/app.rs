@@ -12,6 +12,7 @@
 //! Most methods are intentionally non-blocking; heavy work is pushed to the worker/writer.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -29,7 +30,7 @@ pub struct RenderedImage {
     pub fit_mode: FitMode,
     pub original_size: (u32, u32),
     pub actual_size: (u32, u32),
-    pub encoded_chunks: Vec<Vec<u8>>,
+    pub encoded_chunks: Arc<Vec<Vec<u8>>>,
 }
 
 pub struct App {
@@ -1121,7 +1122,7 @@ mod tests {
             fit_mode: FitMode::Normal,
             original_size: (100, 100),
             actual_size: (1, 1),
-            encoded_chunks: vec![b"x".to_vec()],
+            encoded_chunks: Arc::new(vec![b"x".to_vec()]),
         });
         app.pending_request = Some((PathBuf::from("y.png"), (1, 1), FitMode::Normal));
         app.in_flight_transmit = true;
