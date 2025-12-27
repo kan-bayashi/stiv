@@ -457,38 +457,24 @@ impl TerminalWriter {
             return Vec::new();
         }
 
-        // Calculate tile position using pixel-based calculation (matching worker.rs)
-        // This avoids cumulative rounding errors from cell-based division
-        let canvas_w = u32::from(image_area.width) * u32::from(cell_w);
-        let canvas_h = u32::from(image_area.height) * u32::from(cell_h);
-        let tile_w_px = canvas_w / cols as u32;
-        let tile_h_px = canvas_h / rows as u32;
-        if tile_w_px == 0 || tile_h_px == 0 {
-            return Vec::new();
-        }
+        // Use cell-aligned tile boundaries (matching worker.rs)
+        // This ensures cursor position matches the actual tile positions in the image
+        let canvas_w_cells = u32::from(image_area.width);
+        let canvas_h_cells = u32::from(image_area.height);
 
         let col = cursor_idx % cols;
         let row = cursor_idx / cols;
 
-        // Calculate pixel position, then convert to cell position
-        let tile_x_px = col as u32 * tile_w_px;
-        let tile_y_px = row as u32 * tile_h_px;
-        let tile_x = image_area.x + (tile_x_px / u32::from(cell_w)) as u16;
-        let tile_y = image_area.y + (tile_y_px / u32::from(cell_h)) as u16;
+        // Calculate tile boundaries in cells (same formula as worker.rs)
+        let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
+        let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
+        let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
+        let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
 
-        // Calculate right/bottom edges using next tile's pixel position
-        let tile_x_end = if col + 1 < cols {
-            let next_x_px = (col + 1) as u32 * tile_w_px;
-            image_area.x + (next_x_px / u32::from(cell_w)) as u16
-        } else {
-            image_area.x + image_area.width
-        };
-        let tile_y_end = if row + 1 < rows {
-            let next_y_px = (row + 1) as u32 * tile_h_px;
-            image_area.y + (next_y_px / u32::from(cell_h)) as u16
-        } else {
-            image_area.y + image_area.height
-        };
+        let tile_x = image_area.x + tile_x_cells as u16;
+        let tile_y = image_area.y + tile_y_cells as u16;
+        let tile_x_end = image_area.x + next_tile_x_cells as u16;
+        let tile_y_end = image_area.y + next_tile_y_cells as u16;
 
         // Unicode box drawing characters
         const TOP_LEFT: char = '┌';

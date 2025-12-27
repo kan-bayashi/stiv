@@ -311,16 +311,18 @@ impl ImageWorker {
         let (cols, rows) = grid;
         let (canvas_w, canvas_h) = canvas_size;
 
-        // Calculate tile dimensions
-        let tile_w = canvas_w / cols as u32;
-        let tile_h = canvas_h / rows as u32;
+        // Get cell dimensions for alignment
+        let (cell_w, cell_h) = cell_size.unwrap_or((8, 16));
+        let cell_w = u32::from(cell_w);
+        let cell_h = u32::from(cell_h);
+
+        // Calculate canvas size in cells (for cell-aligned tile boundaries)
+        let canvas_w_cells = canvas_w / cell_w;
+        let canvas_h_cells = canvas_h / cell_h;
 
         // Padding around each thumbnail (leaves space for cursor border).
         // Cursor is 1 cell wide, so padding needs to be at least 1 cell in pixels.
-        let tile_padding = match cell_size {
-            Some((cell_w, cell_h)) => u32::from(cell_w.max(cell_h)),
-            None => 16, // fallback
-        };
+        let tile_padding = cell_w.max(cell_h);
 
         // Create canvas with transparent background
         let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 0]));
@@ -332,6 +334,19 @@ impl ImageWorker {
 
             let col = i % cols;
             let row = i / cols;
+
+            // Calculate tile boundaries aligned to cell boundaries
+            // This ensures cursor (drawn in cell units) matches tile positions
+            let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
+            let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
+            let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
+            let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
+
+            // Convert to pixels
+            let tile_x = tile_x_cells * cell_w;
+            let tile_y = tile_y_cells * cell_h;
+            let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
+            let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
 
             // Half padding on all sides (adjacent tiles share the border)
             let half_pad = tile_padding / 2;
@@ -363,17 +378,12 @@ impl ImageWorker {
             let rgba_thumb = thumbnail.to_rgba8();
 
             // Calculate position to center image in tile cell (with padding)
-            let tile_x = col as u32 * tile_w + half_pad;
-            let tile_y = row as u32 * tile_h + half_pad;
-            let offset_x = (inner_w.saturating_sub(scaled_w)) / 2;
-            let offset_y = (inner_h.saturating_sub(scaled_h)) / 2;
-
-            let x = tile_x + offset_x;
-            let y = tile_y + offset_y;
+            let img_x = tile_x + half_pad + (inner_w.saturating_sub(scaled_w)) / 2;
+            let img_y = tile_y + half_pad + (inner_h.saturating_sub(scaled_h)) / 2;
 
             // Copy thumbnail to canvas
-            if x + scaled_w <= canvas_w && y + scaled_h <= canvas_h {
-                let _ = canvas.copy_from(&rgba_thumb, x, y);
+            if img_x + scaled_w <= canvas_w && img_y + scaled_h <= canvas_h {
+                let _ = canvas.copy_from(&rgba_thumb, img_x, img_y);
             }
         }
 
